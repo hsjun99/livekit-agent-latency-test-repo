@@ -86,25 +86,32 @@ class AudioByteStream:
         self._bytes_per_frame = samples_per_channel * self._bytes_per_sample
         self._buf = bytearray()
 
-    def push(self, frame: rtc.AudioFrame) -> Iterator[rtc.AudioFrame]:
+    def push(self, frame: rtc.AudioFrame | bytes) -> Iterator[rtc.AudioFrame]:
         """Push a new audio frame to the stream and receive fixed-size audio chunks."""
         push_start_ns = time.time_ns()
 
-        # LOG: AudioByteStream input
-        frame_id = log_audio_frame(
-            frame,
-            location="audiobytestream_input",
-            extra_data={
-                "target_chunk_size_ms": round(
-                    (self._bytes_per_frame / self._bytes_per_sample)
-                    / self._sample_rate
-                    * 1000,
-                    2,
-                ),
-                "buffer_fill_bytes": len(self._buf),
-                "frame_size_bytes": len(frame.data),
-            },
-        )
+        # Handle both rtc.AudioFrame and raw bytes input
+        if isinstance(frame, rtc.AudioFrame):
+            # LOG: AudioByteStream input (only for AudioFrame objects)
+            frame_id = log_audio_frame(
+                frame,
+                location="audiobytestream_input",
+                extra_data={
+                    "target_chunk_size_ms": round(
+                        (self._bytes_per_frame / self._bytes_per_sample)
+                        / self._sample_rate
+                        * 1000,
+                        2,
+                    ),
+                    "buffer_fill_bytes": len(self._buf),
+                    "frame_size_bytes": len(frame.data),
+                },
+            )
+            frame_data = frame.data
+        else:
+            # Raw bytes input - no detailed logging, just basic info
+            frame_id = None
+            frame_data = frame
 
         # The operations below are on the frame that was passed into push()
         # If frame_id is None (because the input frame had no audio content and wasn't logged by AUDIO_FLOW),
@@ -113,18 +120,18 @@ class AudioByteStream:
         if frame_id:
             # Memory operation: Buffer append
             append_start = time.time_ns()
-            self._buf.extend(frame.data)
+            self._buf.extend(frame_data)
             append_end = time.time_ns()
 
             log_memory_operation(
                 frame_id=frame_id,
                 location="audiobytestream_buffer_append",
                 operation="buffer_extend",
-                size_bytes=len(frame.data),
+                size_bytes=len(frame_data),
                 duration_ns=append_end - append_start,
             )
         else:  # if frame_id is None, still extend the buffer but without logging
-            self._buf.extend(frame.data)
+            self._buf.extend(frame_data)
 
         chunk_count = 0
         while len(self._buf) >= self._bytes_per_frame:
