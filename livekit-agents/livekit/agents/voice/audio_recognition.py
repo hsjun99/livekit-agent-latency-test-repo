@@ -11,7 +11,7 @@ from livekit import rtc
 from .. import llm, stt, utils, vad
 from ..debug import tracing
 from ..log import logger
-from ..utils import aio, logging
+from ..utils import aio
 from . import io
 from .agent import ModelSettings
 from livekit.agents.utils.audio_logging import (
