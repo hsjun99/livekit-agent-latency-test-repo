@@ -418,45 +418,11 @@ class AudioRecognition:
             return
 
         if isinstance(node, AsyncIterable):
-            async for frame_from_input in audio_input:
-                frame_id_stt = log_audio_frame(
-                    frame_from_input,
-                    location="stt_stream_input",
-                    extra_data={
-                        "stt_provider": type(self._stt).__name__,
-                        "queue_depth": getattr(self._stt_ch, "qsize", lambda: None)(),
-                    },
-                )
-
-                if frame_id_stt:
-                    stt_forward_start = time.time_ns()
-                    await self._stt.push_frame(frame_from_input)
-                    stt_forward_end = time.time_ns()
-                    log_processing_step(
-                        frame_id=frame_id_stt,
-                        location="stt_provider_forward",
-                        operation="forward_to_stt_provider",
-                        start_time_ns=stt_forward_start,
-                        end_time_ns=stt_forward_end,
-                        extra_data={"provider": type(self._stt).__name__},
-                    )
-                else:
-                    await self._stt.push_frame(frame_from_input)
-
-            if hasattr(self._stt, "events") and isinstance(
-                self._stt.events(), AsyncIterable
-            ):
-                async for ev in self._stt.events():
-                    assert isinstance(
-                        ev, stt.SpeechEvent
-                    ), "STT node must yield SpeechEvent"
-                    await self._on_stt_event(ev)
-            elif isinstance(node, AsyncIterable):
-                async for ev in node:
-                    assert isinstance(
-                        ev, stt.SpeechEvent
-                    ), "STT node must yield SpeechEvent"
-                    await self._on_stt_event(ev)
+            async for ev in node:
+                assert isinstance(
+                    ev, stt.SpeechEvent
+                ), "STT node must yield SpeechEvent"
+                await self._on_stt_event(ev)
 
     @utils.log_exceptions(logger=logger)
     async def _vad_task(
