@@ -165,45 +165,46 @@ class _ParticipantInputStream(Generic[T], ABC):
                 },
             )
 
-            # LOG: Frame copy operation
-            copy_start_ns = time.time_ns()
-            frame_copy = cast(T, event.frame)
-            copy_end_ns = time.time_ns()
+            if frame_id:
+                # LOG: Frame copy operation
+                copy_start_ns = time.time_ns()
+                frame_copy = cast(T, event.frame)
+                copy_end_ns = time.time_ns()
 
-            log_memory_operation(
-                frame_id=frame_id,
-                location="webrtc_frame_copy",
-                operation="frame_copy",
-                size_bytes=len(event.frame.data),
-                duration_ns=copy_end_ns - copy_start_ns,
-            )
+                log_memory_operation(
+                    frame_id=frame_id,
+                    location="webrtc_frame_copy",
+                    operation="frame_copy",
+                    size_bytes=len(event.frame.data),
+                    duration_ns=copy_end_ns - copy_start_ns,
+                )
 
-            # LOG: Channel send operation
-            send_start_ns = time.time_ns()
-            await self._data_ch.send(frame_copy)
-            send_end_ns = time.time_ns()
+                # LOG: Channel send operation
+                send_start_ns = time.time_ns()
+                await self._data_ch.send(frame_copy)
+                send_end_ns = time.time_ns()
 
-            log_channel_operation(
-                frame_id=frame_id,
-                location="webrtc_to_room_io",
-                operation="async_channel_send",
-                duration_ns=send_end_ns - send_start_ns,
-                queue_size=getattr(self._data_ch, "qsize", lambda: None)(),
-            )
+                log_channel_operation(
+                    frame_id=frame_id,
+                    location="webrtc_to_room_io",
+                    operation="async_channel_send",
+                    duration_ns=send_end_ns - send_start_ns,
+                    queue_size=getattr(self._data_ch, "qsize", lambda: None)(),
+                )
 
-            # LOG: Complete packet processing
-            reception_end_ns = time.time_ns()
-            log_processing_step(
-                frame_id=frame_id,
-                location="webrtc_packet_complete",
-                operation="complete_packet_processing",
-                start_time_ns=reception_start_ns,
-                end_time_ns=reception_end_ns,
-                extra_data={
-                    "copy_time_ns": copy_end_ns - copy_start_ns,
-                    "send_time_ns": send_end_ns - send_start_ns,
-                },
-            )
+                # LOG: Complete packet processing
+                reception_end_ns = time.time_ns()
+                log_processing_step(
+                    frame_id=frame_id,
+                    location="webrtc_packet_complete",
+                    operation="complete_packet_processing",
+                    start_time_ns=reception_start_ns,
+                    end_time_ns=reception_end_ns,
+                    extra_data={
+                        "copy_time_ns": copy_end_ns - copy_start_ns,
+                        "send_time_ns": send_end_ns - send_start_ns,
+                    },
+                )
 
         logger.debug("stream closed", extra=extra)
 
@@ -342,7 +343,11 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
                             },
                         )
 
-                        await self._data_ch.send(frame)
+                        if frame_id:
+                            await self._data_ch.send(frame)
+                        else:
+                            await self._data_ch.send(frame)
+
                         duration += frame.duration
 
                 if frames:
@@ -395,78 +400,93 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
                 },
             )
 
-            if (
-                not resampler
-                and self._sample_rate is not None
-                and frame.sample_rate != self._sample_rate
-            ):
+            if frame_id:
+                if (
+                    not resampler
+                    and self._sample_rate is not None
+                    and frame.sample_rate != self._sample_rate
+                ):
 
-                # LOG: Resampler creation
-                resampler_create_start = time.time_ns()
-                resampler = rtc.AudioResampler(
-                    input_rate=frame.sample_rate, output_rate=self._sample_rate
-                )
-                resampler_create_end = time.time_ns()
+                    # LOG: Resampler creation
+                    resampler_create_start = time.time_ns()
+                    resampler = rtc.AudioResampler(
+                        input_rate=frame.sample_rate, output_rate=self._sample_rate
+                    )
+                    resampler_create_end = time.time_ns()
 
-                log_processing_step(
-                    frame_id=frame_id,
-                    location="resampler_creation",
-                    operation="create_resampler",
-                    start_time_ns=resampler_create_start,
-                    end_time_ns=resampler_create_end,
-                    extra_data={
-                        "input_rate": frame.sample_rate,
-                        "output_rate": self._sample_rate,
-                    },
-                )
-
-            if resampler:
-                # LOG: Resampling operation
-                resample_op_start = time.time_ns()
-                resampled_frames_list = list(resampler.push(frame))
-                resample_op_end = time.time_ns()
-
-                log_processing_step(
-                    frame_id=frame_id,
-                    location="resampling_operation",
-                    operation="audio_resampling",
-                    start_time_ns=resample_op_start,
-                    end_time_ns=resample_op_end,
-                    extra_data={
-                        "input_samples": frame.samples_per_channel,
-                        "output_frames": len(resampled_frames_list),
-                        "total_output_samples": sum(
-                            f.samples_per_channel for f in resampled_frames_list
-                        ),
-                    },
-                )
-
-                # LOG: Each resampled output frame
-                for i, resampled_frame in enumerate(resampled_frames_list):
-                    output_frame_id = log_audio_frame(
-                        resampled_frame,
-                        location="resampling_output",
-                        frame_id=f"{frame_id}_out_{i}",
+                    log_processing_step(
+                        frame_id=frame_id,
+                        location="resampler_creation",
+                        operation="create_resampler",
+                        start_time_ns=resampler_create_start,
+                        end_time_ns=resampler_create_end,
                         extra_data={
-                            "original_frame_id": frame_id,
-                            "resampled_index": i,
+                            "input_rate": frame.sample_rate,
+                            "output_rate": self._sample_rate,
                         },
                     )
-                    yield resampled_frame
+
+                if resampler:
+                    # LOG: Resampling operation
+                    resample_op_start = time.time_ns()
+                    resampled_frames_list = list(resampler.push(frame))
+                    resample_op_end = time.time_ns()
+
+                    log_processing_step(
+                        frame_id=frame_id,
+                        location="resampling_operation",
+                        operation="audio_resampling",
+                        start_time_ns=resample_op_start,
+                        end_time_ns=resample_op_end,
+                        extra_data={
+                            "input_samples": frame.samples_per_channel,
+                            "output_frames": len(resampled_frames_list),
+                            "total_output_samples": sum(
+                                f.samples_per_channel for f in resampled_frames_list
+                            ),
+                        },
+                    )
+
+                    # LOG: Each resampled output frame
+                    for i, resampled_frame in enumerate(resampled_frames_list):
+                        log_audio_frame(
+                            resampled_frame,
+                            location="resampling_output",
+                            frame_id=f"{frame_id}_out_{i}",
+                            extra_data={
+                                "original_frame_id": frame_id,
+                                "resampled_index": i,
+                            },
+                        )
+                        yield resampled_frame
+                else:
+                    # No resampling needed
+                    passthrough_end_ns = time.time_ns()
+
+                    log_processing_step(
+                        frame_id=frame_id,
+                        location="resampling_passthrough",
+                        operation="passthrough_no_resampling",
+                        start_time_ns=resample_start_ns,
+                        end_time_ns=passthrough_end_ns,
+                        extra_data={"reason": "matching_sample_rates"},
+                    )
+                    yield frame
             else:
-                # No resampling needed
-                passthrough_end_ns = time.time_ns()
+                # If the initial frame wasn't logged, we still need to pass it through the resampler or yield it
+                if (
+                    not resampler
+                    and self._sample_rate is not None
+                    and frame.sample_rate != self._sample_rate
+                ):
+                    resampler = rtc.AudioResampler(
+                        input_rate=frame.sample_rate, output_rate=self._sample_rate
+                    )
 
-                log_processing_step(
-                    frame_id=frame_id,
-                    location="resampling_passthrough",
-                    operation="passthrough_no_resampling",
-                    start_time_ns=resample_start_ns,
-                    end_time_ns=passthrough_end_ns,
-                    extra_data={"reason": "matching_sample_rates"},
-                )
-
-                yield frame
+                if resampler:
+                    yield from resampler.push(frame)
+                else:
+                    yield frame
 
         if resampler:
             yield from resampler.flush()

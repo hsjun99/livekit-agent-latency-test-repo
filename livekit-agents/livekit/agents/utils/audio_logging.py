@@ -133,7 +133,7 @@ def log_audio_frame(
 
     # Check if we should log this frame
     if not should_log_frame(metrics, location):
-        return frame_id
+        return None
 
     # Generate or use provided frame ID
     if frame_id is None:

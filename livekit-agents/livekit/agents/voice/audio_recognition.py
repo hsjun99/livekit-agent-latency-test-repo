@@ -121,44 +121,50 @@ class AudioRecognition:
             },
         )
 
-        # STT path
-        if self._stt_ch is not None:
-            stt_send_start = time.time_ns()
-            self._stt_ch.send_nowait(frame)
-            stt_send_end = time.time_ns()
+        if frame_id:
+            # STT path
+            if self._stt_ch is not None:
+                stt_send_start = time.time_ns()
+                self._stt_ch.send_nowait(frame)
+                stt_send_end = time.time_ns()
 
-            log_channel_operation(
+                log_channel_operation(
+                    frame_id=frame_id,
+                    location="stt_channel_send",
+                    operation="send_to_stt",
+                    duration_ns=stt_send_end - stt_send_start,
+                    queue_size=getattr(self._stt_ch, "qsize", lambda: None)(),
+                )
+
+            # VAD path
+            if self._vad_ch is not None:
+                vad_send_start = time.time_ns()
+                self._vad_ch.send_nowait(frame)
+                vad_send_end = time.time_ns()
+
+                log_channel_operation(
+                    frame_id=frame_id,
+                    location="vad_channel_send",
+                    operation="send_to_vad",
+                    duration_ns=vad_send_end - vad_send_start,
+                    queue_size=getattr(self._vad_ch, "qsize", lambda: None)(),
+                )
+
+            distribution_end_ns = time.time_ns()
+
+            # LOG: Complete distribution
+            log_processing_step(
                 frame_id=frame_id,
-                location="stt_channel_send",
-                operation="send_to_stt",
-                duration_ns=stt_send_end - stt_send_start,
-                queue_size=getattr(self._stt_ch, "qsize", lambda: None)(),
+                location="audio_recognition_distribution_complete",
+                operation="distribute_to_stt_and_vad",
+                start_time_ns=distribution_start_ns,
+                end_time_ns=distribution_end_ns,
             )
-
-        # VAD path
-        if self._vad_ch is not None:
-            vad_send_start = time.time_ns()
-            self._vad_ch.send_nowait(frame)
-            vad_send_end = time.time_ns()
-
-            log_channel_operation(
-                frame_id=frame_id,
-                location="vad_channel_send",
-                operation="send_to_vad",
-                duration_ns=vad_send_end - vad_send_start,
-                queue_size=getattr(self._vad_ch, "qsize", lambda: None)(),
-            )
-
-        distribution_end_ns = time.time_ns()
-
-        # LOG: Complete distribution
-        log_processing_step(
-            frame_id=frame_id,
-            location="audio_recognition_distribution_complete",
-            operation="distribute_to_stt_and_vad",
-            start_time_ns=distribution_start_ns,
-            end_time_ns=distribution_end_ns,
-        )
+        else:  # if frame_id is None, still send to STT/VAD if channels exist, but without logging these steps
+            if self._stt_ch is not None:
+                self._stt_ch.send_nowait(frame)
+            if self._vad_ch is not None:
+                self._vad_ch.send_nowait(frame)
 
     async def aclose(self) -> None:
         await aio.cancel_and_wait(*self._tasks)

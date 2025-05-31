@@ -287,7 +287,7 @@ class VADStream(agents.vad.VADStream):
         speech_threshold_duration = 0.0
         silence_threshold_duration = 0.0
 
-        input_frames = []
+        input_frames_list = []
         inference_frames = []
         resampler: rtc.AudioResampler | None = None
 
@@ -296,15 +296,25 @@ class VADStream(agents.vad.VADStream):
 
         extra_inference_time = 0.0
 
-        async for input_frame in self._input_ch:
+        async for input_frame_from_channel in self._input_ch:
             frame_receive_ns = time.time_ns()
 
-            if not isinstance(input_frame, rtc.AudioFrame):
-                continue  # ignore flush sentinel for now
+            if not isinstance(input_frame_from_channel, rtc.AudioFrame):
+                continue
+
+            # LOG: VAD frame dequeue (This was missing)
+            # This frame_id determines if subsequent detailed logs for this input_frame_from_channel are made.
+            frame_id = log_audio_frame(
+                input_frame_from_channel,  # Use the frame as received from the channel
+                location="vad_frame_dequeue",
+                extra_data={
+                    "queue_depth": getattr(self._input_ch, "qsize", lambda: None)(),
+                    "vad_type": "silero",
+                },
+            )
 
             if not self._input_sample_rate:
-                self._input_sample_rate = input_frame.sample_rate
-
+                self._input_sample_rate = input_frame_from_channel.sample_rate
                 # alloc the buffers now that we know the input sample rate
                 self._prefix_padding_samples = int(
                     self._opts.prefix_padding_duration * self._input_sample_rate
@@ -325,46 +335,122 @@ class VADStream(agents.vad.VADStream):
                         quality=rtc.AudioResamplerQuality.QUICK,  # VAD doesn't need high quality
                     )
 
-            elif self._input_sample_rate != input_frame.sample_rate:
+            elif self._input_sample_rate != input_frame_from_channel.sample_rate:
                 logger.error("a frame with another sample rate was already pushed")
                 continue
 
             assert self._speech_buffer is not None
 
-            input_frames.append(input_frame)
+            input_frames_list.append(input_frame_from_channel)
             if resampler is not None:
                 # the resampler may have a bit of latency, but it is OK to ignore since it should be
                 # negligible
-                inference_frames.extend(resampler.push(input_frame))
+                inference_frames.extend(resampler.push(input_frame_from_channel))
             else:
-                inference_frames.append(input_frame)
+                inference_frames.append(input_frame_from_channel)
 
-            while True:
+            # The while loop processes chunks. If frame_id is None, these logs are skipped.
+            original_frame_id_for_this_input_cycle = (
+                frame_id  # Capture frame_id for this cycle. Now frame_id is defined.
+            )
+
+            while True:  # Keep the original loop condition for VAD logic execution
                 inference_cycle_start = time.time_ns()
 
                 available_inference_samples = sum(
                     [frame.samples_per_channel for frame in inference_frames]
                 )
                 if available_inference_samples < self._model.window_size_samples:
-                    break  # not enough samples to run inference
+                    break
 
-                input_frame = utils.combine_frames(input_frames)
-                inference_frame = utils.combine_frames(inference_frames)
-
-                # convert data to f32
-                np.divide(
-                    inference_frame.data[: self._model.window_size_samples],
-                    np.iinfo(np.int16).max,
-                    out=inference_f32_data,
-                    dtype=np.float32,
+                # This combined_input_frame is based on the current input_frames_list, used for speech buffer copy
+                combined_input_frame_for_buffer = utils.combine_frames(
+                    input_frames_list
                 )
+                # This is the frame used for actual VAD model inference (potentially resampled)
+                current_inference_audio_frame = utils.combine_frames(inference_frames)
 
-                # run the inference
+                if (
+                    original_frame_id_for_this_input_cycle
+                ):  # Only log if the initial frame was logged
+                    # LOG: Frame combination for VAD window (This is about the inference_frame)
+                    combine_start = time.time_ns()
+                    combine_end = time.time_ns()
+
+                    log_processing_step(
+                        frame_id=original_frame_id_for_this_input_cycle,
+                        location="vad_frame_combination",
+                        operation="combine_frames_for_window",
+                        start_time_ns=combine_start,
+                        end_time_ns=combine_end,
+                        extra_data={
+                            "frames_combined_for_inference": len(
+                                inference_frames
+                            ),  # Clarified name
+                            "window_size_samples": self._model.window_size_samples,
+                            "total_samples_in_inference_frame": current_inference_audio_frame.samples_per_channel,
+                        },
+                    )
+
+                    # LOG: Data format conversion
+                    conversion_start = time.time_ns()
+                    np.divide(
+                        current_inference_audio_frame.data[
+                            : self._model.window_size_samples
+                        ],
+                        np.iinfo(np.int16).max,
+                        out=inference_f32_data,
+                        dtype=np.float32,
+                    )
+                    conversion_end = time.time_ns()
+
+                    log_processing_step(
+                        frame_id=original_frame_id_for_this_input_cycle,
+                        location="vad_data_conversion",
+                        operation="int16_to_float32",
+                        start_time_ns=conversion_start,
+                        end_time_ns=conversion_end,
+                        extra_data={
+                            "samples_converted": self._model.window_size_samples,
+                            "input_dtype": "int16",
+                            "output_dtype": "float32",
+                        },
+                    )
+
+                # CRITICAL: VAD Inference
+                inference_start = time.time_ns()
+                # Calculate metrics on the frame fed to the model
+                input_metrics = calculate_audio_metrics(current_inference_audio_frame)
+
+                if original_frame_id_for_this_input_cycle:
+                    logger.info(
+                        f"VAD_INFERENCE_START: {{'frame_id': '{original_frame_id_for_this_input_cycle}', 'location': 'vad_inference_start', 'model_type': 'silero_onnx', 'window_size': {self._model.window_size_samples}, 'input_dbfs': {input_metrics.dbfs}, 'input_has_content': {input_metrics.has_audio_content}, 'timestamp_ns': {inference_start}}}"
+                    )
+
                 p = await self._loop.run_in_executor(
                     self._executor, self._model, inference_f32_data
                 )
-                p = self._exp_filter.apply(exp=1.0, sample=p)
 
+                inference_end = time.time_ns()
+                inference_duration_calc = (
+                    inference_end - inference_start
+                ) / 1_000_000  # Renamed to avoid clash
+
+                filter_start = time.time_ns()
+                p_filtered = self._exp_filter.apply(exp=1.0, sample=p)
+                filter_end = time.time_ns()
+
+                if original_frame_id_for_this_input_cycle:
+                    logger.info(
+                        f"VAD_INFERENCE_COMPLETE: {{'frame_id': '{original_frame_id_for_this_input_cycle}', 'location': 'vad_inference_complete', 'raw_probability': {round(p, 6)}, 'filtered_probability': {round(p_filtered, 6)}, 'inference_latency_ms': {round(inference_duration_calc, 3)}, 'filter_time_ns': {filter_end - filter_start}, 'exceeds_threshold': {p_filtered >= self._opts.activation_threshold}, 'activation_threshold': {self._opts.activation_threshold}, 'input_audio_metrics': {input_metrics.__dict__}, 'timestamp_ns': {inference_end}}}"
+                    )
+
+                    if inference_duration_calc > 50:
+                        logger.warning(
+                            f"SLOW_VAD_INFERENCE: {{'frame_id': '{original_frame_id_for_this_input_cycle}', 'inference_latency_ms': {inference_duration_calc}, 'expected_max_ms': 50, 'timestamp_ns': {inference_end}}}"
+                        )
+
+                # VAD core logic based on p_filtered (original logic from the file)
                 window_duration = (
                     self._model.window_size_samples / self._opts.sample_rate
                 )
@@ -380,13 +466,14 @@ class VADStream(agents.vad.VADStream):
                 to_copy_int = int(to_copy)
                 input_copy_remaining_fract = to_copy - to_copy_int
 
-                # copy the inference window to the speech buffer
                 available_space = len(self._speech_buffer) - speech_buffer_index
                 to_copy_buffer = min(to_copy_int, available_space)
                 if to_copy_buffer > 0:
                     self._speech_buffer[
                         speech_buffer_index : speech_buffer_index + to_copy_buffer
-                    ] = input_frame.data[:to_copy_buffer]
+                    ] = combined_input_frame_for_buffer.data[
+                        :to_copy_buffer
+                    ]  # Use combined_input_frame_for_buffer
                     speech_buffer_index += to_copy_buffer
                 elif not self._speech_buffer_max_reached:
                     # reached self._opts.max_buffered_speech (padding is included)
@@ -395,44 +482,51 @@ class VADStream(agents.vad.VADStream):
                         "max_buffered_speech reached, ignoring further data for the current speech input"  # noqa: E501
                     )
 
-                inference_duration = time.perf_counter() - start_time
+                # The original code had `inference_duration = time.perf_counter() - start_time`
+                # `start_time` was not defined. I am using `inference_duration_calc` calculated above.
+                # The `extra_inference_time` logic seems to rely on this.
+                current_cycle_actual_processing_duration = (
+                    time.time_ns() - inference_cycle_start
+                ) / 1e9  # time from start of this while iter
                 extra_inference_time = max(
                     0.0,
-                    extra_inference_time + inference_duration - window_duration,
+                    extra_inference_time
+                    + current_cycle_actual_processing_duration
+                    - window_duration,
                 )
-                if inference_duration > SLOW_INFERENCE_THRESHOLD:
+                if (
+                    current_cycle_actual_processing_duration > SLOW_INFERENCE_THRESHOLD
+                ):  # SLOW_INFERENCE_THRESHOLD is 0.2s
                     logger.warning(
-                        "inference is slower than realtime",
-                        extra={"delay": extra_inference_time},
+                        "VAD inference cycle is slower than realtime window",
+                        extra={
+                            "delay_ms": extra_inference_time * 1000,
+                            "cycle_duration_ms": current_cycle_actual_processing_duration
+                            * 1000,
+                            "window_duration_ms": window_duration * 1000,
+                        },
                     )
 
                 def _reset_write_cursor():
-                    nonlocal speech_buffer_index, speech_buffer_max_reached
+                    nonlocal speech_buffer_index  # _speech_buffer_max_reached is an instance var, accessed via self
                     assert self._speech_buffer is not None
-
                     if speech_buffer_index <= self._prefix_padding_samples:
                         return
-
                     padding_data = self._speech_buffer[
                         speech_buffer_index
                         - self._prefix_padding_samples : speech_buffer_index
                     ]
-
-                    self._speech_buffer_max_reached = False
+                    self._speech_buffer_max_reached = False  # Accessed via self
                     self._speech_buffer[: self._prefix_padding_samples] = padding_data
                     speech_buffer_index = self._prefix_padding_samples
 
                 def _copy_speech_buffer() -> rtc.AudioFrame:
-                    # copy the data from speech_buffer
                     assert self._speech_buffer is not None
-                    speech_data = self._speech_buffer[
-                        :speech_buffer_index
-                    ].tobytes()  # noqa: B023
-
+                    speech_data = self._speech_buffer[:speech_buffer_index].tobytes()
                     return rtc.AudioFrame(
                         sample_rate=self._input_sample_rate,
                         num_channels=1,
-                        samples_per_channel=speech_buffer_index,  # noqa: B023
+                        samples_per_channel=speech_buffer_index,
                         data=speech_data,
                     )
 
@@ -448,11 +542,14 @@ class VADStream(agents.vad.VADStream):
                         timestamp=pub_timestamp,
                         silence_duration=pub_silence_duration,
                         speech_duration=pub_speech_duration,
-                        probability=p,
-                        inference_duration=inference_duration,
+                        probability=p_filtered,  # Use p_filtered
+                        inference_duration=inference_duration_calc,  # Use calculated duration
                         frames=[
                             rtc.AudioFrame(
-                                data=input_frame.data[:to_copy_int].tobytes(),
+                                # This should be the portion of the original input corresponding to the window
+                                data=combined_input_frame_for_buffer.data[
+                                    :to_copy_int
+                                ].tobytes(),
                                 sample_rate=self._input_sample_rate,
                                 num_channels=1,
                                 samples_per_channel=to_copy_int,
@@ -464,16 +561,14 @@ class VADStream(agents.vad.VADStream):
                     )
                 )
 
-                if p >= self._opts.activation_threshold:
+                if p_filtered >= self._opts.activation_threshold:
                     speech_threshold_duration += window_duration
                     silence_threshold_duration = 0.0
-
                     if not pub_speaking:
                         if speech_threshold_duration >= self._opts.min_speech_duration:
                             pub_speaking = True
                             pub_silence_duration = 0.0
                             pub_speech_duration = speech_threshold_duration
-
                             self._event_ch.send_nowait(
                                 agents.vad.VADEvent(
                                     type=agents.vad.VADEventType.START_OF_SPEECH,
@@ -485,14 +580,11 @@ class VADStream(agents.vad.VADStream):
                                     speaking=True,
                                 )
                             )
-
                 else:
                     silence_threshold_duration += window_duration
                     speech_threshold_duration = 0.0
-
                     if not pub_speaking:
                         _reset_write_cursor()
-
                     if (
                         pub_speaking
                         and silence_threshold_duration
@@ -501,7 +593,6 @@ class VADStream(agents.vad.VADStream):
                         pub_speaking = False
                         pub_speech_duration = 0.0
                         pub_silence_duration = silence_threshold_duration
-
                         self._event_ch.send_nowait(
                             agents.vad.VADEvent(
                                 type=agents.vad.VADEventType.END_OF_SPEECH,
@@ -513,27 +604,35 @@ class VADStream(agents.vad.VADStream):
                                 speaking=False,
                             )
                         )
-
                         _reset_write_cursor()
 
                 # remove the frames that were used for inference from the input and inference frames
-                input_frames = []
+                input_frames_list = (
+                    []
+                )  # Clear the list for the next input_frame_from_channel
                 inference_frames = []
 
-                # add the remaining data
-                if len(input_frame.data) - to_copy_int > 0:
-                    data = input_frame.data[to_copy_int:].tobytes()
-                    input_frames.append(
+                # add the remaining data from combined_input_frame_for_buffer (original rate)
+                if len(combined_input_frame_for_buffer.data) - to_copy_int > 0:
+                    data = combined_input_frame_for_buffer.data[to_copy_int:].tobytes()
+                    input_frames_list.append(
                         rtc.AudioFrame(
                             data=data,
                             sample_rate=self._input_sample_rate,
                             num_channels=1,
-                            samples_per_channel=len(data) // 2,
+                            samples_per_channel=len(data)
+                            // (
+                                1 * 2
+                            ),  # num_channels * bytes_per_sample (assuming 16-bit)
                         )
                     )
-
-                if len(inference_frame.data) - self._model.window_size_samples > 0:
-                    data = inference_frame.data[
+                # add remaining from current_inference_audio_frame (model rate)
+                if (
+                    len(current_inference_audio_frame.data)
+                    - self._model.window_size_samples
+                    > 0
+                ):
+                    data = current_inference_audio_frame.data[
                         self._model.window_size_samples :
                     ].tobytes()
                     inference_frames.append(
@@ -541,6 +640,7 @@ class VADStream(agents.vad.VADStream):
                             data=data,
                             sample_rate=self._opts.sample_rate,
                             num_channels=1,
-                            samples_per_channel=len(data) // 2,
+                            samples_per_channel=len(data)
+                            // (1 * 2),  # num_channels * bytes_per_sample
                         )
                     )
