@@ -11,7 +11,7 @@ from livekit import rtc
 from .. import llm, stt, utils, vad
 from ..debug import tracing
 from ..log import logger
-from ..utils import aio
+from ..utils import aio, logging
 from . import io
 from .agent import ModelSettings
 from livekit.agents.utils.audio_logging import (
@@ -399,7 +399,7 @@ class AudioRecognition:
             _bounce_eou_task(self._last_speaking_time)
         )
 
-    @logging.log_exceptions(logger=logger)
+    @utils.log_exceptions(logger=logger)
     async def _stt_task(
         self,
         stt_node: io.STTNode,
@@ -423,7 +423,7 @@ class AudioRecognition:
                 ), "STT node must yield SpeechEvent"
                 await self._on_stt_event(ev)
 
-    @logging.log_exceptions(logger=logger)
+    @utils.log_exceptions(logger=logger)
     async def _vad_task(
         self, vad: vad.VAD, audio_input: io.AudioInput, task: asyncio.Task[None] | None
     ) -> None:
