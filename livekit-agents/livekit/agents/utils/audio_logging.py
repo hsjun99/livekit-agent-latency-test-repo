@@ -119,12 +119,8 @@ def generate_frame_id() -> str:
 
 def should_log_frame(metrics: SimpleAudioMetrics, location: str) -> bool:
     """Simple logic to determine if frame should be logged."""
-    # Log if has audio content OR at critical pipeline points
-    return metrics.has_audio_content or location in [
-        "webrtc_input",
-        "audio_recognition_input",
-        "vad_inference_complete",
-    ]
+    # Log only if has audio content
+    return metrics.has_audio_content
 
 
 def log_audio_frame(
