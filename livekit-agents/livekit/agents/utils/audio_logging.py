@@ -169,7 +169,7 @@ def log_audio_frame(
     if extra_data:
         log_data.update(extra_data)
 
-    logger.info("AUDIO_FLOW", extra=log_data)
+    logger.info(f"AUDIO_FLOW: {log_data}")
     return frame_id
 
 
@@ -198,7 +198,7 @@ def log_processing_step(
     if extra_data:
         log_data.update(extra_data)
 
-    logger.info("PROCESSING_STEP", extra=log_data)
+    logger.info(f"PROCESSING_STEP: {log_data}")
 
 
 def log_memory_operation(
@@ -218,7 +218,7 @@ def log_memory_operation(
         **timing,
     }
 
-    logger.info("MEMORY_OPERATION", extra=log_data)
+    logger.info(f"MEMORY_OPERATION: {log_data}")
 
 
 def log_channel_operation(
@@ -243,4 +243,4 @@ def log_channel_operation(
     if queue_size is not None:
         log_data["queue_size"] = queue_size
 
-    logger.info("CHANNEL_OPERATION", extra=log_data)
+    logger.info(f"CHANNEL_OPERATION: {log_data}")
