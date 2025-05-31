@@ -93,7 +93,6 @@ class AudioRecognition:
         self._stt_ch: aio.Chan[rtc.AudioFrame] | None = None
         self._vad_ch: aio.Chan[rtc.AudioFrame] | None = None
         self._tasks: set[asyncio.Task] = set()
-        self._total_frames_pushed_count = 0
 
     def start(self) -> None:
         self.update_stt(self._stt)
@@ -104,15 +103,9 @@ class AudioRecognition:
         self.update_vad(None)
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
-        """Push an audio frame to the STT and VAD services."""
-        debug.log_frames_pushed_event(self, frame)
-        self._total_frames_pushed_count += 1
-
-        distribution_start_ns = time.time_ns()
-
         self._sample_rate = frame.sample_rate
 
-        # LOG: Critical distribution point
+        distribution_start_ns = time.time_ns()
         frame_id = log_audio_frame(
             frame,
             location="audio_recognition_input",
@@ -123,13 +116,11 @@ class AudioRecognition:
             },
         )
 
-        if frame_id:
-            # STT path
-            if self._stt_ch is not None:
+        if self._stt_ch is not None:
+            if frame_id:
                 stt_send_start = time.time_ns()
                 self._stt_ch.send_nowait(frame)
                 stt_send_end = time.time_ns()
-
                 log_channel_operation(
                     frame_id=frame_id,
                     location="stt_channel_send",
@@ -137,13 +128,14 @@ class AudioRecognition:
                     duration_ns=stt_send_end - stt_send_start,
                     queue_size=getattr(self._stt_ch, "qsize", lambda: None)(),
                 )
+            else:
+                self._stt_ch.send_nowait(frame)
 
-            # VAD path
-            if self._vad_ch is not None:
+        if self._vad_ch is not None:
+            if frame_id:
                 vad_send_start = time.time_ns()
                 self._vad_ch.send_nowait(frame)
                 vad_send_end = time.time_ns()
-
                 log_channel_operation(
                     frame_id=frame_id,
                     location="vad_channel_send",
@@ -151,10 +143,11 @@ class AudioRecognition:
                     duration_ns=vad_send_end - vad_send_start,
                     queue_size=getattr(self._vad_ch, "qsize", lambda: None)(),
                 )
+            else:
+                self._vad_ch.send_nowait(frame)
 
+        if frame_id:
             distribution_end_ns = time.time_ns()
-
-            # LOG: Complete distribution
             log_processing_step(
                 frame_id=frame_id,
                 location="audio_recognition_distribution_complete",
@@ -162,11 +155,6 @@ class AudioRecognition:
                 start_time_ns=distribution_start_ns,
                 end_time_ns=distribution_end_ns,
             )
-        else:  # if frame_id is None, still send to STT/VAD if channels exist, but without logging these steps
-            if self._stt_ch is not None:
-                self._stt_ch.send_nowait(frame)
-            if self._vad_ch is not None:
-                self._vad_ch.send_nowait(frame)
 
     async def aclose(self) -> None:
         await aio.cancel_and_wait(*self._tasks)
@@ -417,6 +405,11 @@ class AudioRecognition:
         if task is not None:
             await aio.cancel_and_wait(task)
 
+        stt_start_ns = time.time_ns()
+        logger.info(
+            f"STT_STREAM_START: {{'stt_provider': '{type(self._stt).__name__}', 'sample_rate': {self._sample_rate}, 'timestamp_ns': {stt_start_ns}}}"
+        )
+
         node = stt_node(audio_input, ModelSettings())
         if asyncio.iscoroutine(node):
             node = await node
@@ -425,11 +418,45 @@ class AudioRecognition:
             return
 
         if isinstance(node, AsyncIterable):
-            async for ev in node:
-                assert isinstance(
-                    ev, stt.SpeechEvent
-                ), "STT node must yield SpeechEvent"
-                await self._on_stt_event(ev)
+            async for frame_from_input in audio_input:
+                frame_id_stt = log_audio_frame(
+                    frame_from_input,
+                    location="stt_stream_input",
+                    extra_data={
+                        "stt_provider": type(self._stt).__name__,
+                        "queue_depth": getattr(self._stt_ch, "qsize", lambda: None)(),
+                    },
+                )
+
+                if frame_id_stt:
+                    stt_forward_start = time.time_ns()
+                    await self._stt.push_frame(frame_from_input)
+                    stt_forward_end = time.time_ns()
+                    log_processing_step(
+                        frame_id=frame_id_stt,
+                        location="stt_provider_forward",
+                        operation="forward_to_stt_provider",
+                        start_time_ns=stt_forward_start,
+                        end_time_ns=stt_forward_end,
+                        extra_data={"provider": type(self._stt).__name__},
+                    )
+                else:
+                    await self._stt.push_frame(frame_from_input)
+
+            if hasattr(self._stt, "events") and isinstance(
+                self._stt.events(), AsyncIterable
+            ):
+                async for ev in self._stt.events():
+                    assert isinstance(
+                        ev, stt.SpeechEvent
+                    ), "STT node must yield SpeechEvent"
+                    await self._on_stt_event(ev)
+            elif isinstance(node, AsyncIterable):
+                async for ev in node:
+                    assert isinstance(
+                        ev, stt.SpeechEvent
+                    ), "STT node must yield SpeechEvent"
+                    await self._on_stt_event(ev)
 
     @utils.log_exceptions(logger=logger)
     async def _vad_task(
