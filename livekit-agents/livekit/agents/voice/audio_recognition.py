@@ -14,6 +14,11 @@ from ..log import logger
 from ..utils import aio
 from . import io
 from .agent import ModelSettings
+from livekit.agents.utils.audio_logging import (
+    log_audio_frame,
+    log_channel_operation,
+    log_processing_step,
+)
 
 
 @dataclass
@@ -97,12 +102,63 @@ class AudioRecognition:
         self.update_vad(None)
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
-        self._sample_rate = frame.sample_rate
-        if self._stt_ch is not None:
-            self._stt_ch.send_nowait(frame)
+        """Push an audio frame to the STT and VAD services."""
+        debug_utils.log_frames_pushed_event(self, frame)
+        self._total_frames_pushed_count += 1
 
+        distribution_start_ns = time.time_ns()
+
+        self._sample_rate = frame.sample_rate
+
+        # LOG: Critical distribution point
+        frame_id = log_audio_frame(
+            frame,
+            location="audio_recognition_input",
+            extra_data={
+                "distribution_target": "stt_and_vad",
+                "stt_enabled": self._stt_ch is not None,
+                "vad_enabled": self._vad_ch is not None,
+            },
+        )
+
+        # STT path
+        if self._stt_ch is not None:
+            stt_send_start = time.time_ns()
+            self._stt_ch.send_nowait(frame)
+            stt_send_end = time.time_ns()
+
+            log_channel_operation(
+                frame_id=frame_id,
+                location="stt_channel_send",
+                operation="send_to_stt",
+                duration_ns=stt_send_end - stt_send_start,
+                queue_size=getattr(self._stt_ch, "qsize", lambda: None)(),
+            )
+
+        # VAD path
         if self._vad_ch is not None:
+            vad_send_start = time.time_ns()
             self._vad_ch.send_nowait(frame)
+            vad_send_end = time.time_ns()
+
+            log_channel_operation(
+                frame_id=frame_id,
+                location="vad_channel_send",
+                operation="send_to_vad",
+                duration_ns=vad_send_end - vad_send_start,
+                queue_size=getattr(self._vad_ch, "qsize", lambda: None)(),
+            )
+
+        distribution_end_ns = time.time_ns()
+
+        # LOG: Complete distribution
+        log_processing_step(
+            frame_id=frame_id,
+            location="audio_recognition_distribution_complete",
+            operation="distribute_to_stt_and_vad",
+            start_time_ns=distribution_start_ns,
+            end_time_ns=distribution_end_ns,
+        )
 
     async def aclose(self) -> None:
         await aio.cancel_and_wait(*self._tasks)
@@ -294,14 +350,21 @@ class AudioRecognition:
 
             if turn_detector is not None:
                 if not turn_detector.supports_language(self._last_language):
-                    logger.debug("Turn detector does not support language %s", self._last_language)
+                    logger.debug(
+                        "Turn detector does not support language %s",
+                        self._last_language,
+                    )
                 else:
-                    end_of_turn_probability = await turn_detector.predict_end_of_turn(chat_ctx)
+                    end_of_turn_probability = await turn_detector.predict_end_of_turn(
+                        chat_ctx
+                    )
                     tracing.Tracing.log_event(
                         "end of user turn probability",
                         {"probability": end_of_turn_probability},
                     )
-                    unlikely_threshold = turn_detector.unlikely_threshold(self._last_language)
+                    unlikely_threshold = turn_detector.unlikely_threshold(
+                        self._last_language
+                    )
                     if (
                         unlikely_threshold is not None
                         and end_of_turn_probability < unlikely_threshold
@@ -311,7 +374,9 @@ class AudioRecognition:
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))
 
-            tracing.Tracing.log_event("end of user turn", {"transcript": self._audio_transcript})
+            tracing.Tracing.log_event(
+                "end of user turn", {"transcript": self._audio_transcript}
+            )
             committed = await self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
                     new_transcript=self._audio_transcript,
@@ -330,9 +395,11 @@ class AudioRecognition:
             self._end_of_turn_task.cancel()
 
         # copy the last_speaking_time before awaiting (the value can change)
-        self._end_of_turn_task = asyncio.create_task(_bounce_eou_task(self._last_speaking_time))
+        self._end_of_turn_task = asyncio.create_task(
+            _bounce_eou_task(self._last_speaking_time)
+        )
 
-    @utils.log_exceptions(logger=logger)
+    @logging.log_exceptions(logger=logger)
     async def _stt_task(
         self,
         stt_node: io.STTNode,
@@ -351,10 +418,12 @@ class AudioRecognition:
 
         if isinstance(node, AsyncIterable):
             async for ev in node:
-                assert isinstance(ev, stt.SpeechEvent), "STT node must yield SpeechEvent"
+                assert isinstance(
+                    ev, stt.SpeechEvent
+                ), "STT node must yield SpeechEvent"
                 await self._on_stt_event(ev)
 
-    @utils.log_exceptions(logger=logger)
+    @logging.log_exceptions(logger=logger)
     async def _vad_task(
         self, vad: vad.VAD, audio_input: io.AudioInput, task: asyncio.Task[None] | None
     ) -> None:

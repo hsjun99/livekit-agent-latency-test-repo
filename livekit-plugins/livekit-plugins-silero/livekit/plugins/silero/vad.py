@@ -34,6 +34,11 @@ from livekit.agents.utils import is_given
 
 from . import onnx_model
 from .log import logger
+from livekit.agents.utils.audio_logging import (
+    calculate_audio_metrics,
+    log_audio_frame,
+    log_processing_step,
+)
 
 SLOW_INFERENCE_THRESHOLD = 0.2  # late by 200ms
 
@@ -202,7 +207,9 @@ class VAD(agents.vad.VAD):
 
 
 class VADStream(agents.vad.VADStream):
-    def __init__(self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel) -> None:
+    def __init__(
+        self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel
+    ) -> None:
         super().__init__(vad)
         self._opts, self._model = opts, model
         self._loop = asyncio.get_event_loop()
@@ -290,6 +297,8 @@ class VADStream(agents.vad.VADStream):
         extra_inference_time = 0.0
 
         async for input_frame in self._input_ch:
+            frame_receive_ns = time.time_ns()
+
             if not isinstance(input_frame, rtc.AudioFrame):
                 continue  # ignore flush sentinel for now
 
@@ -331,7 +340,7 @@ class VADStream(agents.vad.VADStream):
                 inference_frames.append(input_frame)
 
             while True:
-                start_time = time.perf_counter()
+                inference_cycle_start = time.time_ns()
 
                 available_inference_samples = sum(
                     [frame.samples_per_channel for frame in inference_frames]
@@ -356,14 +365,17 @@ class VADStream(agents.vad.VADStream):
                 )
                 p = self._exp_filter.apply(exp=1.0, sample=p)
 
-                window_duration = self._model.window_size_samples / self._opts.sample_rate
+                window_duration = (
+                    self._model.window_size_samples / self._opts.sample_rate
+                )
 
                 pub_current_sample += self._model.window_size_samples
                 pub_timestamp += window_duration
 
                 resampling_ratio = self._input_sample_rate / self._model.sample_rate
                 to_copy = (
-                    self._model.window_size_samples * resampling_ratio + input_copy_remaining_fract
+                    self._model.window_size_samples * resampling_ratio
+                    + input_copy_remaining_fract
                 )
                 to_copy_int = int(to_copy)
                 input_copy_remaining_fract = to_copy - to_copy_int
@@ -402,7 +414,8 @@ class VADStream(agents.vad.VADStream):
                         return
 
                     padding_data = self._speech_buffer[
-                        speech_buffer_index - self._prefix_padding_samples : speech_buffer_index
+                        speech_buffer_index
+                        - self._prefix_padding_samples : speech_buffer_index
                     ]
 
                     self._speech_buffer_max_reached = False
@@ -412,7 +425,9 @@ class VADStream(agents.vad.VADStream):
                 def _copy_speech_buffer() -> rtc.AudioFrame:
                     # copy the data from speech_buffer
                     assert self._speech_buffer is not None
-                    speech_data = self._speech_buffer[:speech_buffer_index].tobytes()  # noqa: B023
+                    speech_data = self._speech_buffer[
+                        :speech_buffer_index
+                    ].tobytes()  # noqa: B023
 
                     return rtc.AudioFrame(
                         sample_rate=self._input_sample_rate,
@@ -480,7 +495,8 @@ class VADStream(agents.vad.VADStream):
 
                     if (
                         pub_speaking
-                        and silence_threshold_duration >= self._opts.min_silence_duration
+                        and silence_threshold_duration
+                        >= self._opts.min_silence_duration
                     ):
                         pub_speaking = False
                         pub_speech_duration = 0.0
@@ -517,7 +533,9 @@ class VADStream(agents.vad.VADStream):
                     )
 
                 if len(inference_frame.data) - self._model.window_size_samples > 0:
-                    data = inference_frame.data[self._model.window_size_samples :].tobytes()
+                    data = inference_frame.data[
+                        self._model.window_size_samples :
+                    ].tobytes()
                     inference_frames.append(
                         rtc.AudioFrame(
                             data=data,

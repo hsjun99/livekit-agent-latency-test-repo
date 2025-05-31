@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from typing import Union
+import time
 
 import aiofiles
 
@@ -11,6 +12,11 @@ from livekit import rtc
 
 from ..log import logger
 from .aio.utils import cancel_and_wait
+from livekit.agents.utils.audio_logging import (
+    log_audio_frame,
+    log_memory_operation,
+    log_processing_step,
+)
 
 # deprecated aliases
 AudioBuffer = Union[list[rtc.AudioFrame], rtc.AudioFrame]
@@ -80,42 +86,103 @@ class AudioByteStream:
         self._bytes_per_frame = samples_per_channel * self._bytes_per_sample
         self._buf = bytearray()
 
-    def push(self, data: bytes) -> list[rtc.AudioFrame]:
-        """
-        Add audio data to the buffer and retrieve fixed-size frames.
+    def push(self, frame: rtc.AudioFrame) -> Iterator[rtc.AudioFrame]:
+        """Push a new audio frame to the stream and receive fixed-size audio chunks."""
+        push_start_ns = time.time_ns()
 
-        Parameters:
-            data (bytes): The incoming audio data to buffer.
+        # LOG: AudioByteStream input
+        frame_id = log_audio_frame(
+            frame,
+            location="audiobytestream_input",
+            extra_data={
+                "target_chunk_size_ms": round(
+                    (self._bytes_per_frame / self._bytes_per_sample)
+                    / self._sample_rate
+                    * 1000,
+                    2,
+                ),
+                "buffer_fill_bytes": len(self._buf),
+                "frame_size_bytes": len(frame.data),
+            },
+        )
 
-        Returns:
-            list[rtc.AudioFrame]: A list of `AudioFrame` objects of fixed size.
+        # Memory operation: Buffer append
+        append_start = time.time_ns()
+        self._buf.extend(frame.data)
+        append_end = time.time_ns()
 
-        The method appends the incoming data to the internal buffer.
-        While the buffer contains enough data to form complete frames,
-        it extracts the data for each frame, creates an `AudioFrame` object,
-        and appends it to the list of frames to return.
+        log_memory_operation(
+            frame_id=frame_id,
+            location="audiobytestream_buffer_append",
+            operation="buffer_extend",
+            size_bytes=len(frame.data),
+            duration_ns=append_end - append_start,
+        )
 
-        This allows you to feed in variable-sized chunks of audio data
-        (e.g., from a stream or file) and receive back a list of
-        fixed-size audio frames ready for processing or transmission.
-        """
-        self._buf.extend(data)
-
-        frames = []
+        chunk_count = 0
         while len(self._buf) >= self._bytes_per_frame:
-            frame_data = self._buf[: self._bytes_per_frame]
-            self._buf = self._buf[self._bytes_per_frame :]
+            chunk_start = time.time_ns()
 
-            frames.append(
-                rtc.AudioFrame(
-                    data=frame_data,
-                    sample_rate=self._sample_rate,
-                    num_channels=self._num_channels,
-                    samples_per_channel=len(frame_data) // self._bytes_per_sample,
-                )
+            # Memory operation: Chunk extraction
+            extract_start = time.time_ns()
+            chunk_data = self._buf[: self._bytes_per_frame]
+            self._buf = self._buf[self._bytes_per_frame :]
+            extract_end = time.time_ns()
+
+            # Create output frame
+            frame_create_start = time.time_ns()
+            chunk_frame = rtc.AudioFrame(
+                data=chunk_data,
+                sample_rate=self._sample_rate,
+                num_channels=self._num_channels,
+                samples_per_channel=self._bytes_per_frame // self._bytes_per_sample,
+            )
+            frame_create_end = time.time_ns()
+
+            chunk_end = time.time_ns()
+            chunk_count += 1
+
+            # LOG: Chunk output
+            chunk_frame_id = log_audio_frame(
+                chunk_frame,
+                location="audiobytestream_chunk_output",
+                frame_id=f"{frame_id}_chunk_{chunk_count}",
+                extra_data={
+                    "original_frame_id": frame_id,
+                    "chunk_number": chunk_count,
+                    "buffer_remaining_bytes": len(self._buf),
+                },
             )
 
-        return frames
+            log_processing_step(
+                frame_id=chunk_frame_id,
+                location="audiobytestream_chunk_creation",
+                operation="create_audio_chunk",
+                start_time_ns=chunk_start,
+                end_time_ns=chunk_end,
+                extra_data={
+                    "extract_time_ns": extract_end - extract_start,
+                    "frame_create_time_ns": frame_create_end - frame_create_start,
+                    "chunk_size_bytes": len(chunk_data),
+                },
+            )
+
+            yield chunk_frame
+
+        push_end_ns = time.time_ns()
+
+        # LOG: Complete push operation
+        log_processing_step(
+            frame_id=frame_id,
+            location="audiobytestream_push_complete",
+            operation="complete_audiobytestream_push",
+            start_time_ns=push_start_ns,
+            end_time_ns=push_end_ns,
+            extra_data={
+                "chunks_produced": chunk_count,
+                "buffer_remaining": len(self._buf),
+            },
+        )
 
     write = push  # Alias for the push method.
 
