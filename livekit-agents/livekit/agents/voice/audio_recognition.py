@@ -9,9 +9,10 @@ from typing import Protocol
 from livekit import rtc
 
 from .. import llm, stt, utils, vad
+from .. import debug
 from ..debug import tracing
 from ..log import logger
-from ..utils import aio, debug_utils
+from ..utils import aio
 from . import io
 from .agent import ModelSettings
 from livekit.agents.utils.audio_logging import (
@@ -92,6 +93,7 @@ class AudioRecognition:
         self._stt_ch: aio.Chan[rtc.AudioFrame] | None = None
         self._vad_ch: aio.Chan[rtc.AudioFrame] | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._total_frames_pushed_count = 0
 
     def start(self) -> None:
         self.update_stt(self._stt)
@@ -103,7 +105,7 @@ class AudioRecognition:
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         """Push an audio frame to the STT and VAD services."""
-        debug_utils.log_frames_pushed_event(self, frame)
+        debug.log_frames_pushed_event(self, frame)
         self._total_frames_pushed_count += 1
 
         distribution_start_ns = time.time_ns()
