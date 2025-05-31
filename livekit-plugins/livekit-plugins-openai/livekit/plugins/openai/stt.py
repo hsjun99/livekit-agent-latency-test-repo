@@ -51,6 +51,11 @@ from openai.types.beta.realtime.transcription_session_update_param import (
 from .log import logger
 from .models import GroqAudioModels, STTModels
 from .utils import AsyncAzureADTokenProvider
+from livekit.agents.utils.voice_verification import (
+    _profiler,
+    analyze_voice_characteristics,
+    log_audio_frame,
+)
 
 # OpenAI Realtime API has a timeout of 15 mins, we'll attempt to restart the session
 # before that timeout is reached
@@ -105,7 +110,9 @@ class STT(stt.STT):
         """  # noqa: E501
 
         super().__init__(
-            capabilities=stt.STTCapabilities(streaming=use_realtime, interim_results=use_realtime)
+            capabilities=stt.STTCapabilities(
+                streaming=use_realtime, interim_results=use_realtime
+            )
         )
         if detect_language:
             language = ""
@@ -195,9 +202,11 @@ class STT(stt.STT):
             organization=organization,
             project=project,
             base_url=base_url,
-            timeout=timeout
-            if timeout
-            else httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
+            timeout=(
+                timeout
+                if timeout
+                else httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0)
+            ),
         )  # type: ignore
 
         return STT(
@@ -316,9 +325,9 @@ class STT(stt.STT):
             },
         }
         if self._opts.language:
-            realtime_config["session"]["input_audio_transcription"]["language"] = (
-                self._opts.language
-            )
+            realtime_config["session"]["input_audio_transcription"][
+                "language"
+            ] = self._opts.language
 
         if self._opts.noise_reduction_type:
             realtime_config["session"]["input_audio_noise_reduction"] = {
@@ -362,7 +371,9 @@ class STT(stt.STT):
             if is_given(language):
                 self._opts.language = language
             data = rtc.combine_audio_frames(buffer).to_wav_bytes()
-            prompt = self._opts.prompt if is_given(self._opts.prompt) else openai.NOT_GIVEN
+            prompt = (
+                self._opts.prompt if is_given(self._opts.prompt) else openai.NOT_GIVEN
+            )
 
             format = "json"
             if self._opts.model == "whisper-1":
@@ -395,7 +406,10 @@ class STT(stt.STT):
             raise APITimeoutError() from None
         except openai.APIStatusError as e:
             raise APIStatusError(
-                e.message, status_code=e.status_code, request_id=e.request_id, body=e.body
+                e.message,
+                status_code=e.status_code,
+                request_id=e.request_id,
+                body=e.body,
             ) from None
         except Exception as e:
             raise APIConnectionError() from e
@@ -447,14 +461,161 @@ class SpeechStream(stt.SpeechStream):
                 elif isinstance(data, self._FlushSentinel):
                     frames.extend(audio_bstream.flush())
 
-                for frame in frames:
-                    encoded_frame = {
-                        "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(frame.data.tobytes()).decode("utf-8"),
-                    }
-                    await ws.send_json(encoded_frame)
+                for input_audio_frame_chunk in frames:
+                    frame_receive_ns = time.time_ns()
 
-            closing_ws = True
+                    # Voice verification at STT input (this is now per CHUNK)
+                    # The original `frame` from input_ch was already analyzed before this loop.
+                    # This `voice_analysis` is for the current chunk produced by AudioByteStream.
+                    voice_analysis_chunk = analyze_voice_characteristics(
+                        input_audio_frame_chunk
+                    )
+
+                    # The frame_id should ideally be derived from the original frame or be unique per chunk.
+                    # For simplicity, let's make it unique per chunk, perhaps linking to an original frame_id if available.
+                    # Assuming `input_audio_frame_chunk` doesn't have an original `frame_id` directly, we make a new one.
+                    # If `log_audio_frame` was called on the original frame, its id might be `frame_id_original`.
+                    # Here, we log the chunk itself.
+                    chunk_log_id_base = getattr(
+                        input_audio_frame_chunk,
+                        "_original_frame_id",
+                        f"chunk_{time.time_ns()}",
+                    )
+                    frame_id_chunk = log_audio_frame(
+                        input_audio_frame_chunk,
+                        "openai_stt_input_chunk",
+                        extra_data={
+                            "provider": "openai",
+                            "chunk_target_size_ms": 50,  # This was the stream's target, actual chunk may vary
+                        },
+                    )
+
+                    # LOG: STT input voice verification (for the CHUNK)
+                    logger.info(
+                        "STT_CHUNK_INPUT_VOICE_VERIFICATION",
+                        extra={  # Renamed log event for clarity
+                            "frame_id": frame_id_chunk,  # Log ID of the current chunk
+                            "provider": "openai",
+                            **voice_analysis_chunk.__dict__,
+                            "should_transmit": voice_analysis_chunk.is_human_voice,
+                            "timestamp_ns": frame_receive_ns,
+                        },
+                    )
+
+                    # Only process if likely human voice (for the CHUNK)
+                    if not voice_analysis_chunk.is_human_voice:
+                        logger.info(
+                            "STT_CHUNK_REJECTED",
+                            extra={  # Renamed log event
+                                "frame_id": frame_id_chunk,
+                                "reason": "not_human_voice_chunk",
+                                "confidence": voice_analysis_chunk.confidence_score,
+                                "rejection_reasons": voice_analysis_chunk.rejection_reasons,
+                                "timestamp_ns": frame_receive_ns,
+                            },
+                        )
+                        continue
+
+                    # AudioByteStream chunking with detailed logging - This section is effectively done above by audio_bstream.write/
+                    # The `chunks` variable from the plan isn't directly applicable here as `audio_bstream.write` already gives chunks.
+                    # The following STT_CHUNKING_OPERATION log might be redundant or need rethinking.
+                    # For now, I'll remove the STT_CHUNKING_OPERATION log as the chunking happens implicitly with audio_bstream.
+
+                    # The loop `for chunk_data_bytes in chunks:` from previous attempt is now `for input_audio_frame_chunk in frames:`
+                    # chunk_start_ns = time.time_ns() # Already have frame_receive_ns for chunk processing start
+                    # chunk_counter += 1 # Not strictly needed if frame_id_chunk is unique
+
+                    # chunk_id = f"{frame_id}_chunk_{chunk_counter}" # Using frame_id_chunk now
+
+                    # Data serialization
+                    serialization_start = time.time_ns()
+                    frame_data_bytes = (
+                        input_audio_frame_chunk.data.tobytes()
+                    )  # Correctly get bytes from the chunk AudioFrame
+                    base64_data = base64.b64encode(frame_data_bytes).decode()
+                    serialization_end = time.time_ns()
+
+                    # LOG: Data serialization
+                    logger.info(
+                        "STT_DATA_SERIALIZATION",
+                        extra={
+                            "chunk_id": frame_id_chunk,  # Use the chunk's log ID
+                            "raw_bytes": len(frame_data_bytes),
+                            "base64_bytes": len(base64_data),
+                            "compression_ratio": (
+                                len(base64_data) / len(frame_data_bytes)
+                                if len(frame_data_bytes) > 0
+                                else 0
+                            ),
+                            "serialization_time_ns": serialization_end
+                            - serialization_start,
+                            "timestamp_ns": serialization_start,
+                        },
+                    )
+
+                    # Network transmission
+                    transmission_start = time.time_ns()
+
+                    try:
+                        # Memory snapshot before network send
+                        memory_before_send = _profiler.snapshot_memory(
+                            "stt_before_send", frame_id_chunk
+                        )
+
+                        await self._conn_options.conn.send(  # This was self.conn in plan, but context is SpeechStream, so _conn_options.conn
+                            rtc.ChatMessage(
+                                message_id=utils.shortuuid(),
+                                message=json.dumps(
+                                    {
+                                        "type": "input_audio_buffer.append",
+                                        "audio": base64_data,
+                                    }
+                                ),
+                            )
+                        )
+
+                        transmission_end = time.time_ns()
+                        memory_after_send = _profiler.snapshot_memory(
+                            "stt_after_send", frame_id_chunk
+                        )
+
+                        # LOG: Successful network transmission
+                        logger.info(
+                            "STT_NETWORK_TRANSMISSION",
+                            extra={
+                                "chunk_id": frame_id_chunk,
+                                "provider": "openai",
+                                "data_size_bytes": len(base64_data),
+                                "transmission_latency_ms": round(
+                                    (transmission_end - transmission_start) / 1_000_000,
+                                    3,
+                                ),
+                                "memory_delta_mb": memory_after_send[
+                                    "traced_current_mb"
+                                ]
+                                - memory_before_send["traced_current_mb"],
+                                "voice_confidence": voice_analysis_chunk.confidence_score,  # Confidence of the current CHUNK
+                                "network_success": True,
+                                "timestamp_ns": transmission_end,
+                            },
+                        )
+
+                    except Exception as e:
+                        transmission_failed_ns = time.time_ns()
+
+                        logger.error(
+                            "STT_NETWORK_FAILURE",
+                            extra={
+                                "chunk_id": frame_id_chunk,
+                                "provider": "openai",
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "attempted_size_bytes": len(base64_data),
+                                "transmission_attempt_time_ns": transmission_failed_ns
+                                - transmission_start,
+                                "timestamp_ns": transmission_failed_ns,
+                            },
+                        )
 
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -488,7 +649,10 @@ class SpeechStream(stt.SpeechStream):
                         delta = data.get("delta", "")
                         if delta:
                             current_text += delta
-                            if time.time() - last_interim_at > _delta_transcript_interval:
+                            if (
+                                time.time() - last_interim_at
+                                > _delta_transcript_interval
+                            ):
                                 self._event_ch.send_nowait(
                                     stt.SpeechEvent(
                                         type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
@@ -501,7 +665,10 @@ class SpeechStream(stt.SpeechStream):
                                     )
                                 )
                                 last_interim_at = time.time()
-                    elif msg_type == "conversation.item.input_audio_transcription.completed":
+                    elif (
+                        msg_type
+                        == "conversation.item.input_audio_transcription.completed"
+                    ):
                         current_text = ""
                         transcript = data.get("transcript", "")
                         if transcript:

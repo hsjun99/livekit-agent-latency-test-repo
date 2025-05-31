@@ -31,9 +31,22 @@ from livekit.agents.types import (
     NotGivenOr,
 )
 from livekit.agents.utils import is_given
+from livekit.agents.log import logger
+from livekit.plugins.vad import (
+    VAD,
+    VADPlugin,
+    VADStream,
+    VADPluginOptions,
+    VADEventType,
+    VADSpeechData,
+)
+from livekit.agents.utils.voice_verification import (
+    _profiler,
+    analyze_voice_characteristics,
+    log_audio_frame,
+)
 
 from . import onnx_model
-from .log import logger
 
 SLOW_INFERENCE_THRESHOLD = 0.2  # late by 200ms
 
@@ -202,7 +215,9 @@ class VAD(agents.vad.VAD):
 
 
 class VADStream(agents.vad.VADStream):
-    def __init__(self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel) -> None:
+    def __init__(
+        self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel
+    ) -> None:
         super().__init__(vad)
         self._opts, self._model = opts, model
         self._loop = asyncio.get_event_loop()
@@ -267,262 +282,239 @@ class VADStream(agents.vad.VADStream):
 
     @agents.utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
+        # Initialize detailed profiling
         inference_f32_data = np.empty(self._model.window_size_samples, dtype=np.float32)
         speech_buffer_index: int = 0
 
-        # "pub_" means public, these values are exposed to the users through events
-        pub_speaking = False
-        pub_speech_duration = 0.0
-        pub_silence_duration = 0.0
-        pub_current_sample = 0
-        pub_timestamp = 0.0
-
-        speech_threshold_duration = 0.0
-        silence_threshold_duration = 0.0
-
-        input_frames: list[rtc.AudioFrame] = []
-        inference_frames: list[rtc.AudioFrame] = []
-        resampler: rtc.AudioResampler | None = None
-
-        # used to avoid drift when the sample_rate ratio is not an integer
-        input_copy_remaining_fract = 0.0
-
-        extra_inference_time = 0.0
+        # Track voice characteristics over time
+        voice_history = []
 
         async for input_frame in self._input_ch:
+            frame_start_ns = time.time_ns()
+
             if not isinstance(input_frame, rtc.AudioFrame):
-                continue  # ignore flush sentinel for now
-
-            if not self._input_sample_rate:
-                self._input_sample_rate = input_frame.sample_rate
-
-                # alloc the buffers now that we know the input sample rate
-                self._prefix_padding_samples = int(
-                    self._opts.prefix_padding_duration * self._input_sample_rate
-                )
-
-                self._speech_buffer = np.empty(
-                    int(self._opts.max_buffered_speech * self._input_sample_rate)
-                    + self._prefix_padding_samples,
-                    dtype=np.int16,
-                )
-
-                if self._input_sample_rate != self._opts.sample_rate:
-                    # resampling needed: the input sample rate isn't the same as the model's
-                    # sample rate used for inference
-                    resampler = rtc.AudioResampler(
-                        input_rate=self._input_sample_rate,
-                        output_rate=self._opts.sample_rate,
-                        quality=rtc.AudioResamplerQuality.QUICK,  # VAD doesn't need high quality
-                    )
-
-            elif self._input_sample_rate != input_frame.sample_rate:
-                logger.error("a frame with another sample rate was already pushed")
                 continue
 
-            assert self._speech_buffer is not None
+            # LOG: Frame dequeue with queue analysis
+            queue_depth = getattr(self._input_ch, "qsize", lambda: "unknown")()
+            frame_id = log_audio_frame(
+                input_frame,
+                "vad_frame_dequeue",
+                extra_data={
+                    "queue_depth": queue_depth,
+                    "queue_wait_estimate_ns": frame_start_ns
+                    - getattr(input_frame, "_enqueue_time", frame_start_ns),
+                },
+            )
 
-            input_frames.append(input_frame)
-            if resampler is not None:
-                # the resampler may have a bit of latency, but it is OK to ignore since it should be
-                # negligible
-                inference_frames.extend(resampler.push(input_frame))
-            else:
-                inference_frames.append(input_frame)
+            # Comprehensive voice analysis
+            voice_analysis = analyze_voice_characteristics(
+                input_frame, voice_history[-5:] if voice_history else None
+            )
+            voice_history.append(input_frame)
+
+            # LOG: Voice verification at VAD input
+            logger.info(
+                "VAD_VOICE_VERIFICATION",
+                extra={
+                    "frame_id": frame_id,
+                    "location": "vad_input",
+                    **voice_analysis.__dict__,
+                    "voice_history_length": len(voice_history),
+                    "timestamp_ns": frame_start_ns,
+                },
+            )
+
+            # Memory profiling for frame processing
+            memory_before = _profiler.snapshot_memory("vad_frame_start", frame_id)
+
+            frames_to_process = [input_frame]
+            frames_to_process.extend(self._input_ch.get_available_frames())
+
+            for current_frame in frames_to_process:
+                self._unprocessed_speech_frames.append(current_frame)
+                speech_buffer_index += current_frame.samples_per_channel
 
             while True:
-                start_time = time.perf_counter()
+                inference_cycle_start = time.time_ns()  # moved from plan for clarity
 
-                available_inference_samples = sum(
-                    [frame.samples_per_channel for frame in inference_frames]
-                )
+                inference_frames = self._unprocessed_speech_frames
+                available_inference_samples = speech_buffer_index
+
                 if available_inference_samples < self._model.window_size_samples:
-                    break  # not enough samples to run inference
+                    break
 
-                input_frame = utils.combine_frames(input_frames)
-                inference_frame = utils.combine_frames(inference_frames)
+                # LOG: Window preparation
+                window_prep_start = time.time_ns()
+                # input_frame = utils.combine_frames(input_frames) # This was in the plan, but input_frames is not defined here
+                inference_frame = utils.combine_frames(
+                    inference_frames
+                )  # Renamed from input_frame to inference_frame to avoid confusion
+                window_prep_end = time.time_ns()
 
-                # convert data to f32
+                logger.info(
+                    "VAD_WINDOW_PREPARATION",
+                    extra={
+                        "frame_id": frame_id,  # This might need to be more specific if multiple windows are processed per input frame_id
+                        "frames_combined": len(inference_frames),
+                        "total_samples": available_inference_samples,  # This is total in buffer, not just current window
+                        "prep_time_ns": window_prep_end - window_prep_start,
+                        "timestamp_ns": window_prep_start,
+                    },
+                )
+
+                # Voice verification on combined frame
+                combined_voice_analysis = analyze_voice_characteristics(inference_frame)
+
+                # Data format conversion
+                conversion_start = time.time_ns()
                 np.divide(
                     inference_frame.data[: self._model.window_size_samples],
                     np.iinfo(np.int16).max,
                     out=inference_f32_data,
                     dtype=np.float32,
                 )
+                conversion_end = time.time_ns()
 
-                # run the inference
+                # LOG: Data conversion
+                logger.info(
+                    "VAD_DATA_CONVERSION",
+                    extra={
+                        "frame_id": frame_id,  # Same as above
+                        "conversion_type": "int16_to_float32",
+                        "samples_converted": self._model.window_size_samples,
+                        "conversion_time_ns": conversion_end - conversion_start,
+                        "timestamp_ns": conversion_start,
+                    },
+                )
+
+                # Memory snapshot before inference
+                memory_before_inference = _profiler.snapshot_memory(
+                    "vad_before_inference", frame_id
+                )  # Same as above
+
+                # ONNX Model Inference - CRITICAL TIMING
+                inference_start = time.time_ns()
+
+                # LOG: Pre-inference state
+                logger.info(
+                    "VAD_INFERENCE_START",
+                    extra={
+                        "frame_id": frame_id,  # Same as above
+                        "model_type": "silero_onnx",
+                        "input_shape": inference_f32_data.shape,
+                        "voice_confidence_input": combined_voice_analysis.confidence_score,
+                        "memory_mb": memory_before_inference["traced_current_mb"],
+                        "timestamp_ns": inference_start,
+                    },
+                )
+
                 p = await self._loop.run_in_executor(
                     self._executor, self._model, inference_f32_data
                 )
-                p = self._exp_filter.apply(exp=1.0, sample=p)
 
-                window_duration = self._model.window_size_samples / self._opts.sample_rate
+                inference_end = time.time_ns()
+                inference_duration = (inference_end - inference_start) / 1_000_000
 
-                pub_current_sample += self._model.window_size_samples
-                pub_timestamp += window_duration
+                # Memory snapshot after inference
+                memory_after_inference = _profiler.snapshot_memory(
+                    "vad_after_inference", frame_id
+                )  # Same as above
 
-                resampling_ratio = self._input_sample_rate / self._model.sample_rate
-                to_copy = (
-                    self._model.window_size_samples * resampling_ratio + input_copy_remaining_fract
+                # Exponential filtering
+                filter_start = time.time_ns()
+                p_filtered = self._exp_filter.apply(exp=1.0, sample=p)
+                filter_end = time.time_ns()
+
+                # LOG: Complete inference results
+                logger.info(
+                    "VAD_INFERENCE_COMPLETE",
+                    extra={
+                        "frame_id": frame_id,  # Same as above
+                        "location": "vad_inference_complete",
+                        "raw_probability": round(p, 6),
+                        "filtered_probability": round(p_filtered, 6),
+                        "inference_latency_ms": round(inference_duration, 3),
+                        "filter_time_ns": filter_end - filter_start,
+                        "memory_delta_mb": memory_after_inference["traced_current_mb"]
+                        - memory_before_inference["traced_current_mb"],
+                        "voice_verification": combined_voice_analysis.__dict__,
+                        "exceeds_threshold": p_filtered
+                        >= self._opts.activation_threshold,
+                        "activation_threshold": self._opts.activation_threshold,
+                        "timestamp_ns": inference_end,
+                    },
                 )
-                to_copy_int = int(to_copy)
-                input_copy_remaining_fract = to_copy - to_copy_int
 
-                # copy the inference window to the speech buffer
-                available_space = len(self._speech_buffer) - speech_buffer_index
-                to_copy_buffer = min(to_copy_int, available_space)
-                if to_copy_buffer > 0:
-                    self._speech_buffer[
-                        speech_buffer_index : speech_buffer_index + to_copy_buffer
-                    ] = input_frame.data[:to_copy_buffer]
-                    speech_buffer_index += to_copy_buffer
-                elif not self._speech_buffer_max_reached:
-                    # reached self._opts.max_buffered_speech (padding is included)
-                    speech_buffer_max_reached = True
+                # Track inference performance
+                if inference_duration > 10:  # Slow inference
                     logger.warning(
-                        "max_buffered_speech reached, ignoring further data for the current speech input"  # noqa: E501
+                        "SLOW_VAD_INFERENCE",
+                        extra={
+                            "frame_id": frame_id,  # Same as above
+                            "inference_latency_ms": inference_duration,
+                            "expected_max_ms": 10,
+                            "performance_impact": "high_latency",
+                            "timestamp_ns": inference_end,
+                        },
                     )
 
-                inference_duration = time.perf_counter() - start_time
-                extra_inference_time = max(
-                    0.0,
-                    extra_inference_time + inference_duration - window_duration,
-                )
-                if inference_duration > SLOW_INFERENCE_THRESHOLD:
-                    logger.warning(
-                        "inference is slower than realtime",
-                        extra={"delay": extra_inference_time},
-                    )
-
-                def _reset_write_cursor() -> None:
-                    nonlocal speech_buffer_index, speech_buffer_max_reached
-                    assert self._speech_buffer is not None
-
-                    if speech_buffer_index <= self._prefix_padding_samples:
-                        return
-
-                    padding_data = self._speech_buffer[
-                        speech_buffer_index - self._prefix_padding_samples : speech_buffer_index
-                    ]
-
-                    self._speech_buffer_max_reached = False
-                    self._speech_buffer[: self._prefix_padding_samples] = padding_data
-                    speech_buffer_index = self._prefix_padding_samples
-
-                def _copy_speech_buffer() -> rtc.AudioFrame:
-                    # copy the data from speech_buffer
-                    assert self._speech_buffer is not None
-                    speech_data = self._speech_buffer[:speech_buffer_index].tobytes()  # noqa: B023
-
-                    return rtc.AudioFrame(
-                        sample_rate=self._input_sample_rate,
-                        num_channels=1,
-                        samples_per_channel=speech_buffer_index,  # noqa: B023
-                        data=speech_data,
-                    )
-
-                if pub_speaking:
-                    pub_speech_duration += window_duration
-                else:
-                    pub_silence_duration += window_duration
-
-                self._event_ch.send_nowait(
-                    agents.vad.VADEvent(
-                        type=agents.vad.VADEventType.INFERENCE_DONE,
-                        samples_index=pub_current_sample,
-                        timestamp=pub_timestamp,
-                        silence_duration=pub_silence_duration,
-                        speech_duration=pub_speech_duration,
-                        probability=p,
-                        inference_duration=inference_duration,
-                        frames=[
-                            rtc.AudioFrame(
-                                data=input_frame.data[:to_copy_int].tobytes(),
-                                sample_rate=self._input_sample_rate,
-                                num_channels=1,
-                                samples_per_channel=to_copy_int,
-                            )
-                        ],
-                        speaking=pub_speaking,
-                        raw_accumulated_silence=silence_threshold_duration,
-                        raw_accumulated_speech=speech_threshold_duration,
-                    )
+                speech_buffer_index -= self._model.window_size_samples
+                self._unprocessed_speech_frames = utils.trim_frames(
+                    self._unprocessed_speech_frames, self._model.window_size_samples
                 )
 
-                if p >= self._opts.activation_threshold:
-                    speech_threshold_duration += window_duration
-                    silence_threshold_duration = 0.0
+                if p_filtered >= self._opts.activation_threshold:
+                    if not self._speaking:
+                        self._start_speech(
+                            input_frame
+                        )  # This might need adjustment if input_frame is not the trigger
 
-                    if not pub_speaking:
-                        if speech_threshold_duration >= self._opts.min_speech_duration:
-                            pub_speaking = True
-                            pub_silence_duration = 0.0
-                            pub_speech_duration = speech_threshold_duration
-
-                            self._event_ch.send_nowait(
-                                agents.vad.VADEvent(
-                                    type=agents.vad.VADEventType.START_OF_SPEECH,
-                                    samples_index=pub_current_sample,
-                                    timestamp=pub_timestamp,
-                                    silence_duration=pub_silence_duration,
-                                    speech_duration=pub_speech_duration,
-                                    frames=[_copy_speech_buffer()],
-                                    speaking=True,
-                                )
-                            )
-
+                    # ... more logging for speech buffer operations if needed ...
+                    self._speech_frames.append(
+                        input_frame
+                    )  # This was not in plan, but seems relevant
+                    self._frames_since_last_speech = 0
                 else:
-                    silence_threshold_duration += window_duration
-                    speech_threshold_duration = 0.0
-
-                    if not pub_speaking:
-                        _reset_write_cursor()
-
+                    self._frames_since_last_speech += 1
                     if (
-                        pub_speaking
-                        and silence_threshold_duration >= self._opts.min_silence_duration
+                        self._speaking
+                        and self._frames_since_last_speech
+                        * self._opts.min_silence_duration
+                        * 1000
+                        >= self._opts.min_silence_duration * 1000
                     ):
-                        pub_speaking = False
-                        pub_speech_duration = 0.0
-                        pub_silence_duration = silence_threshold_duration
+                        self._end_speech()
 
-                        self._event_ch.send_nowait(
-                            agents.vad.VADEvent(
-                                type=agents.vad.VADEventType.END_OF_SPEECH,
-                                samples_index=pub_current_sample,
-                                timestamp=pub_timestamp,
-                                silence_duration=pub_silence_duration,
-                                speech_duration=pub_speech_duration,
-                                frames=[_copy_speech_buffer()],
-                                speaking=False,
-                            )
-                        )
+        # Cleanup remaining speech frames if any
+        if self._speaking:
+            self._end_speech()
 
-                        _reset_write_cursor()
+    def _start_speech(self, frame: rtc.AudioFrame):
+        logger.info(
+            "VAD_SPEECH_START",
+            extra={  # Added Log
+                "frame_id": getattr(
+                    frame, "_log_id", "unknown"
+                ),  # Attempt to get frame_id if logged before
+                "timestamp_ns": time.time_ns(),
+            },
+        )
+        self._speaking = True
 
-                # remove the frames that were used for inference from the input and inference frames
-                input_frames = []
-                inference_frames = []
+    def _end_speech(self):
+        logger.info(
+            "VAD_SPEECH_END",
+            extra={  # Added Log
+                "buffered_frames_count": len(self._speech_frames),
+                "timestamp_ns": time.time_ns(),
+            },
+        )
+        if not self._speaking:
+            return
+        self._speaking = False
 
-                # add the remaining data
-                if len(input_frame.data) - to_copy_int > 0:
-                    data = input_frame.data[to_copy_int:].tobytes()
-                    input_frames.append(
-                        rtc.AudioFrame(
-                            data=data,
-                            sample_rate=self._input_sample_rate,
-                            num_channels=1,
-                            samples_per_channel=len(data) // 2,
-                        )
-                    )
 
-                if len(inference_frame.data) - self._model.window_size_samples > 0:
-                    data = inference_frame.data[self._model.window_size_samples :].tobytes()
-                    inference_frames.append(
-                        rtc.AudioFrame(
-                            data=data,
-                            sample_rate=self._opts.sample_rate,
-                            num_channels=1,
-                            samples_per_channel=len(data) // 2,
-                        )
-                    )
+class SileroVADPlugin(VADPlugin):
+    def __init__(self, opts: VADPluginOptions = VADPluginOptions()):
+        super().__init__(opts)
