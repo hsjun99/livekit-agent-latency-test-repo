@@ -92,7 +92,8 @@ class AudioByteStream:
 
         # Handle both rtc.AudioFrame and raw bytes input
         if isinstance(frame, rtc.AudioFrame):
-            # LOG: AudioByteStream input (only for AudioFrame objects)
+            frame_data = frame.data
+            # LOG: AudioByteStream input (only for AudioFrame objects, and only if it has audio content)
             frame_id = log_audio_frame(
                 frame,
                 location="audiobytestream_input",
@@ -107,18 +108,14 @@ class AudioByteStream:
                     "frame_size_bytes": len(frame.data),
                 },
             )
-            frame_data = frame.data
         else:
-            # Raw bytes input - no detailed logging, just basic info
-            frame_id = None
+            # Raw bytes input - no detailed logging
             frame_data = frame
+            frame_id = None
 
-        # The operations below are on the frame that was passed into push()
-        # If frame_id is None (because the input frame had no audio content and wasn't logged by AUDIO_FLOW),
-        # then these memory/processing logs should also be skipped.
-
+        # CORE FUNCTIONALITY: Always extend buffer regardless of logging
         if frame_id:
-            # Memory operation: Buffer append
+            # Log the buffer append operation if frame was logged
             append_start = time.time_ns()
             self._buf.extend(frame_data)
             append_end = time.time_ns()
@@ -130,80 +127,75 @@ class AudioByteStream:
                 size_bytes=len(frame_data),
                 duration_ns=append_end - append_start,
             )
-        else:  # if frame_id is None, still extend the buffer but without logging
+        else:
+            # Always extend buffer, just don't log it
             self._buf.extend(frame_data)
 
+        # CORE FUNCTIONALITY: Always process chunks regardless of logging
         chunk_count = 0
         while len(self._buf) >= self._bytes_per_frame:
-            chunk_start_ns_for_log = (
-                time.time_ns()
-            )  # Renamed to avoid conflict if frame_id is None
-
-            # Memory operation: Chunk extraction
-            extract_start_ns_for_log = time.time_ns()
+            # Extract chunk data
             chunk_data = self._buf[: self._bytes_per_frame]
             self._buf = self._buf[self._bytes_per_frame :]
-            extract_end_ns_for_log = time.time_ns()
 
-            # Create output frame
-            frame_create_start_ns_for_log = time.time_ns()
+            # Create output frame - ALWAYS
             chunk_frame = rtc.AudioFrame(
                 data=chunk_data,
                 sample_rate=self._sample_rate,
                 num_channels=self._num_channels,
                 samples_per_channel=self._bytes_per_frame // self._bytes_per_sample,
             )
-            frame_create_end_ns_for_log = time.time_ns()
-            chunk_end_ns_for_log = time.time_ns()
 
-            # If the original input frame (frame_id) was logged, then log its chunks if they have content.
-            # The log_audio_frame for the chunk itself will decide based on its own content via should_log_frame.
-            # However, the processing step for creating this chunk should be tied to the original frame_id.
+            chunk_count += 1
 
-            chunk_frame_id_from_log = None  # Initialize for clarity
-            if frame_id:  # Only attempt to log chunk if original frame was logged
-                chunk_frame_id_from_log = log_audio_frame(
+            # CONDITIONAL LOGGING: Only log chunk processing if original frame was logged
+            if frame_id:
+                chunk_start_ns = time.time_ns()
+                extract_start_ns = time.time_ns()
+                extract_end_ns = time.time_ns()
+                frame_create_start_ns = time.time_ns()
+                frame_create_end_ns = time.time_ns()
+                chunk_end_ns = time.time_ns()
+
+                # Log the output chunk (this will decide internally if chunk has audio content)
+                chunk_frame_id = log_audio_frame(
                     chunk_frame,
                     location="audiobytestream_chunk_output",
-                    frame_id=f"{frame_id}_chunk_{chunk_count + 1}",  # Use chunk_count + 1 for 1-based indexing for logs
+                    frame_id=f"{frame_id}_chunk_{chunk_count}",
                     extra_data={
                         "original_frame_id": frame_id,
-                        "chunk_number": chunk_count + 1,
+                        "chunk_number": chunk_count,
                         "buffer_remaining_bytes": len(self._buf),
                     },
                 )
 
-                # Log processing step for chunk creation only if original frame was logged
+                # Log processing step for chunk creation
                 log_processing_step(
                     frame_id=(
-                        chunk_frame_id_from_log
-                        if chunk_frame_id_from_log
-                        else f"{frame_id}_chunk_{chunk_count + 1}"
-                    ),  # Use the id from chunk log, or construct if chunk wasn't logged but original was
+                        chunk_frame_id
+                        if chunk_frame_id
+                        else f"{frame_id}_chunk_{chunk_count}"
+                    ),
                     location="audiobytestream_chunk_creation",
                     operation="create_audio_chunk",
-                    start_time_ns=chunk_start_ns_for_log,
-                    end_time_ns=chunk_end_ns_for_log,
+                    start_time_ns=chunk_start_ns,
+                    end_time_ns=chunk_end_ns,
                     extra_data={
-                        "extract_time_ns": extract_end_ns_for_log
-                        - extract_start_ns_for_log,
-                        "frame_create_time_ns": frame_create_end_ns_for_log
-                        - frame_create_start_ns_for_log,
                         "chunk_size_bytes": len(chunk_data),
                     },
                 )
 
-            chunk_count += 1  # Increment chunk_count regardless of logging
-            yield chunk_frame  # Yield chunk_frame regardless of logging
+            # CORE FUNCTIONALITY: Always yield chunk regardless of logging
+            yield chunk_frame
 
-        # Log the completion of the push operation only if the initial frame was logged.
+        # CONDITIONAL LOGGING: Only log push completion if original frame was logged
         if frame_id:
             push_end_ns = time.time_ns()
             log_processing_step(
                 frame_id=frame_id,
                 location="audiobytestream_push_complete",
                 operation="complete_audiobytestream_push",
-                start_time_ns=push_start_ns,  # push_start_ns defined at the beginning of the function
+                start_time_ns=push_start_ns,
                 end_time_ns=push_end_ns,
                 extra_data={
                     "chunks_produced": chunk_count,
