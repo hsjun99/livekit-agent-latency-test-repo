@@ -83,8 +83,8 @@ class SafeAudioLogger:
             zero_count = data_bytes.count(b"\x00")
             silence_ratio = zero_count / len(data_bytes)
 
-            # If more than 95% of bytes are zero, consider it silence
-            has_content = silence_ratio < 0.95
+            # If more than 90% of bytes are zero, consider it silence
+            has_content = silence_ratio < 0.90
 
             return has_content
 
