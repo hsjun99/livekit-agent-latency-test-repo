@@ -100,7 +100,13 @@ class SafeAudioLogger:
             rms = np.sqrt(np.mean(np.square(audio_float)))
 
             # If RMS > 0, then dBFS > -infinity, meaning there's some audio content
-            has_content = rms > 0
+
+            # logger.info(f"RMS: {rms}")
+
+            # has_content = rms > 0
+            has_content = 20 * np.log10(rms) > 30
+            if has_content:
+                logger.info(f"DBFS: {20 * np.log10(rms)}")
             return has_content
 
         except Exception as e:

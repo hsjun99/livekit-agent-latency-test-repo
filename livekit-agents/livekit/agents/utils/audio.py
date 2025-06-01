@@ -122,16 +122,22 @@ class AudioByteStream:
             data=data,
             sample_rate=self._sample_rate,
             num_channels=self._num_channels,
-            samples_per_channel=len(data) // self._bytes_per_sample,
+            # Calculate samples_per_channel carefully to avoid division by zero if _bytes_per_sample is 0 (though unlikely)
+            samples_per_channel=(
+                len(data) // self._bytes_per_sample if self._bytes_per_sample > 0 else 0
+            ),
         )
 
-        # SAFE: Log AudioByteStream input
         frame_id = safe_log_checkpoint(
             "audiobytestream_input",
             temp_frame,
             extra={
                 "target_chunk_size_ms": round(
-                    (self._bytes_per_frame / self._bytes_per_sample)
+                    (
+                        self._bytes_per_frame / self._bytes_per_sample
+                        if self._bytes_per_sample > 0
+                        else 0
+                    )
                     / self._sample_rate
                     * 1000,
                     2,
@@ -142,7 +148,6 @@ class AudioByteStream:
             filter_silent=True,
         )
 
-        # SAFE: Time buffer append operation
         with safe_timing(
             frame_id, "audiobytestream_buffer_append", extra={"size_bytes": len(data)}
         ):
@@ -152,9 +157,12 @@ class AudioByteStream:
         chunk_count = 0
         while len(self._buf) >= self._bytes_per_frame:
             chunk_count += 1
-            chunk_frame_id = f"{frame_id}_chunk_{chunk_count}"
+            # If the parent frame_id is None (due to initial silence filtering),
+            # then chunk_frame_id should also be None.
+            chunk_frame_id = (
+                f"{frame_id}_chunk_{chunk_count}" if frame_id is not None else None
+            )
 
-            # SAFE: Time chunk creation logic
             with safe_timing(
                 chunk_frame_id,
                 "audiobytestream_chunk_creation_logic",
@@ -167,16 +175,19 @@ class AudioByteStream:
                     data=frame_data,
                     sample_rate=self._sample_rate,
                     num_channels=self._num_channels,
-                    samples_per_channel=len(frame_data) // self._bytes_per_sample,
+                    samples_per_channel=(
+                        len(frame_data) // self._bytes_per_sample
+                        if self._bytes_per_sample > 0
+                        else 0
+                    ),
                 )
 
-            # SAFE: Log chunk output
             safe_log_checkpoint(
                 "audiobytestream_chunk_output",
                 chunk_frame,
-                frame_id=chunk_frame_id,
+                frame_id=chunk_frame_id,  # This will be None if parent was None
                 extra={
-                    "original_frame_id": frame_id,
+                    "original_frame_id": frame_id,  # This can be None
                     "chunk_number": chunk_count,
                     "buffer_remaining_bytes": len(self._buf),
                 },
