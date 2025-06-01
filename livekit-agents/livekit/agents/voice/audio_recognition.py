@@ -12,6 +12,7 @@ from .. import llm, stt, utils, vad
 from ..debug import tracing
 from ..log import logger
 from ..utils import aio
+from ..utils.common_audio_logger import record_audio_frame_timestamp
 from . import io
 from .agent import ModelSettings
 
@@ -97,11 +98,22 @@ class AudioRecognition:
         self.update_vad(None)
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
+        # Record timestamp when frame is received
+        record_audio_frame_timestamp(frame, "AudioRecognition", "frame_received")
+
         self._sample_rate = frame.sample_rate
         if self._stt_ch is not None:
+            # Record timestamp before sending to STT channel
+            record_audio_frame_timestamp(
+                frame, "AudioRecognition", "frame_sent_to_stt_ch"
+            )
             self._stt_ch.send_nowait(frame)
 
         if self._vad_ch is not None:
+            # Record timestamp before sending to VAD channel
+            record_audio_frame_timestamp(
+                frame, "AudioRecognition", "frame_sent_to_vad_ch"
+            )
             self._vad_ch.send_nowait(frame)
 
     async def aclose(self) -> None:
@@ -294,14 +306,21 @@ class AudioRecognition:
 
             if turn_detector is not None:
                 if not turn_detector.supports_language(self._last_language):
-                    logger.debug("Turn detector does not support language %s", self._last_language)
+                    logger.debug(
+                        "Turn detector does not support language %s",
+                        self._last_language,
+                    )
                 else:
-                    end_of_turn_probability = await turn_detector.predict_end_of_turn(chat_ctx)
+                    end_of_turn_probability = await turn_detector.predict_end_of_turn(
+                        chat_ctx
+                    )
                     tracing.Tracing.log_event(
                         "end of user turn probability",
                         {"probability": end_of_turn_probability},
                     )
-                    unlikely_threshold = turn_detector.unlikely_threshold(self._last_language)
+                    unlikely_threshold = turn_detector.unlikely_threshold(
+                        self._last_language
+                    )
                     if (
                         unlikely_threshold is not None
                         and end_of_turn_probability < unlikely_threshold
@@ -311,7 +330,9 @@ class AudioRecognition:
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))
 
-            tracing.Tracing.log_event("end of user turn", {"transcript": self._audio_transcript})
+            tracing.Tracing.log_event(
+                "end of user turn", {"transcript": self._audio_transcript}
+            )
             committed = await self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
                     new_transcript=self._audio_transcript,
@@ -330,7 +351,9 @@ class AudioRecognition:
             self._end_of_turn_task.cancel()
 
         # copy the last_speaking_time before awaiting (the value can change)
-        self._end_of_turn_task = asyncio.create_task(_bounce_eou_task(self._last_speaking_time))
+        self._end_of_turn_task = asyncio.create_task(
+            _bounce_eou_task(self._last_speaking_time)
+        )
 
     @utils.log_exceptions(logger=logger)
     async def _stt_task(
@@ -351,7 +374,9 @@ class AudioRecognition:
 
         if isinstance(node, AsyncIterable):
             async for ev in node:
-                assert isinstance(ev, stt.SpeechEvent), "STT node must yield SpeechEvent"
+                assert isinstance(
+                    ev, stt.SpeechEvent
+                ), "STT node must yield SpeechEvent"
                 await self._on_stt_event(ev)
 
     @utils.log_exceptions(logger=logger)

@@ -12,6 +12,7 @@ from livekit.rtc._proto.track_pb2 import AudioTrackFeature
 
 from ...log import logger
 from ...utils import aio, log_exceptions
+from ...utils.common_audio_logger import record_audio_frame_timestamp
 from ..io import AudioInput, VideoInput
 from ._pre_connect_audio import PreConnectAudioHandler
 
@@ -90,7 +91,9 @@ class _ParticipantInputStream(Generic[T], ABC):
     def set_participant(self, participant: rtc.Participant | str | None) -> None:
         # set_participant can be called before the participant is connected
         participant_identity = (
-            participant.identity if isinstance(participant, rtc.Participant) else participant
+            participant.identity
+            if isinstance(participant, rtc.Participant)
+            else participant
         )
         if self._participant_identity == participant_identity:
             return
@@ -143,12 +146,29 @@ class _ParticipantInputStream(Generic[T], ABC):
             if not self._attached:
                 # drop frames if the stream is detached
                 continue
+
+            # Record timestamp when frame is received from rtc stream
+            if isinstance(event.frame, rtc.AudioFrame):
+                record_audio_frame_timestamp(
+                    event.frame,
+                    "_ParticipantInputStream",
+                    "frame_received_from_rtc_stream",
+                )
+
+            # Record timestamp before sending to data channel
+            if isinstance(event.frame, rtc.AudioFrame):
+                record_audio_frame_timestamp(
+                    event.frame, "_ParticipantInputStream", "frame_sent_to_data_ch"
+                )
+
             await self._data_ch.send(event.frame)
 
         logger.debug("stream closed", extra=extra)
 
     @abstractmethod
-    def _create_stream(self, track: rtc.RemoteTrack) -> rtc.VideoStream | rtc.AudioStream: ...
+    def _create_stream(
+        self, track: rtc.RemoteTrack
+    ) -> rtc.VideoStream | rtc.AudioStream: ...
 
     def _close_stream(self) -> None:
         if self._stream is not None:
@@ -175,12 +195,16 @@ class _ParticipantInputStream(Generic[T], ABC):
         self._stream = self._create_stream(track)
         self._publication = publication
         self._forward_atask = asyncio.create_task(
-            self._forward_task(self._forward_atask, self._stream, publication, participant)
+            self._forward_task(
+                self._forward_atask, self._stream, publication, participant
+            )
         )
         return True
 
     def _on_track_unavailable(
-        self, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
+        self,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
     ) -> None:
         if (
             not self._publication
@@ -246,9 +270,25 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
             }
             try:
                 duration = 0
-                frames = await self._pre_connect_audio_handler.wait_for_data(publication.track.sid)
+                frames = await self._pre_connect_audio_handler.wait_for_data(
+                    publication.track.sid
+                )
                 for frame in self._resample_frames(frames):
                     if self._attached:
+                        # Record timestamp for pre-connect frames processed by resampler
+                        record_audio_frame_timestamp(
+                            frame,
+                            "_ParticipantAudioInputStream",
+                            "pre_connect_frame_processed_by_resampler",
+                        )
+
+                        # Record timestamp before sending to data channel
+                        record_audio_frame_timestamp(
+                            frame,
+                            "_ParticipantAudioInputStream",
+                            "pre_connect_frame_about_to_send_to_data_ch",
+                        )
+
                         await self._data_ch.send(frame)
                         duration += frame.duration
                 if frames:
@@ -265,7 +305,9 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
 
             except Exception as e:
                 logger.error(
-                    "error reading pre-connect audio buffer", extra=logging_extra, exc_info=e
+                    "error reading pre-connect audio buffer",
+                    extra=logging_extra,
+                    exc_info=e,
                 )
 
         await super()._forward_task(old_task, stream, publication, participant)
@@ -281,7 +323,9 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
             )
         )
 
-    def _resample_frames(self, frames: Iterable[rtc.AudioFrame]) -> Iterable[rtc.AudioFrame]:
+    def _resample_frames(
+        self, frames: Iterable[rtc.AudioFrame]
+    ) -> Iterable[rtc.AudioFrame]:
         resampler: rtc.AudioResampler | None = None
         for frame in frames:
             if (

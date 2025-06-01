@@ -5,7 +5,15 @@ import copy
 import time
 from collections.abc import AsyncIterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, Union, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Generic,
+    Literal,
+    Protocol,
+    TypeVar,
+    Union,
+    runtime_checkable,
+)
 
 from livekit import rtc
 
@@ -16,6 +24,7 @@ from ..llm import ChatContext
 from ..log import logger
 from ..types import NOT_GIVEN, NotGivenOr
 from ..utils.misc import is_given
+from ..utils.common_audio_logger import record_audio_frame_timestamp
 from . import io, room_io
 from .agent import Agent
 from .agent_activity import AgentActivity
@@ -49,7 +58,9 @@ class VoiceOptions:
 
 Userdata_T = TypeVar("Userdata_T")
 
-TurnDetectionMode = Union[Literal["stt", "vad", "realtime_llm", "manual"], _TurnDetector]
+TurnDetectionMode = Union[
+    Literal["stt", "vad", "realtime_llm", "manual"], _TurnDetector
+]
 """
 The mode of turn detection to use.
 
@@ -160,7 +171,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 an interruption, only used if stt enabled. Default ``0``.
             min_endpointing_delay (float): Minimum time-in-seconds the agent
                 must wait after a potential end-of-utterance signal (from VAD
-                or an EOU model) before it declares the user’s turn complete.
+                or an EOU model) before it declares the user's turn complete.
                 Default ``0.5`` s.
             max_endpointing_delay (float): Maximum time-in-seconds the agent
                 will wait before terminating the turn. Default ``6.0`` s.
@@ -201,7 +212,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._mcp_servers = mcp_servers or None
 
         # configurable IO
-        self._input = io.AgentInput(self._on_video_input_changed, self._on_audio_input_changed)
+        self._input = io.AgentInput(
+            self._on_video_input_changed, self._on_audio_input_changed
+        )
         self._output = io.AgentOutput(
             self._on_video_output_changed,
             self._on_audio_output_changed,
@@ -374,7 +387,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 await self._room_io.start()
 
             else:
-                if not self._room_io and not self.output.audio and not self.output.transcription:
+                if (
+                    not self._room_io
+                    and not self.output.audio
+                    and not self.output.transcription
+                ):
                     logger.warning(
                         "session starts without output, forgetting to pass `room` to `AgentSession.start()`?"  # noqa: E501
                     )
@@ -408,8 +425,12 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             return  # can happen at startup
 
         chat_ctx = self._activity.agent.chat_ctx
-        debug.Tracing.store_kv("chat_ctx", chat_ctx.to_dict(exclude_function_call=False))
-        debug.Tracing.store_kv("history", self.history.to_dict(exclude_function_call=False))
+        debug.Tracing.store_kv(
+            "chat_ctx", chat_ctx.to_dict(exclude_function_call=False)
+        )
+        debug.Tracing.store_kv(
+            "history", self.history.to_dict(exclude_function_call=False)
+        )
 
     async def drain(self) -> None:
         if self._activity is None:
@@ -511,7 +532,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         if self._activity.draining:
             if self._next_activity is None:
-                raise RuntimeError("AgentSession is closing, cannot use generate_reply()")
+                raise RuntimeError(
+                    "AgentSession is closing, cannot use generate_reply()"
+                )
 
             return self._next_activity._generate_reply(
                 user_message=user_message,
@@ -573,7 +596,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         if self._closing_task or error.recoverable:
             return
 
-        logger.error("AgentSession is closing due to unrecoverable error", exc_info=error.error)
+        logger.error(
+            "AgentSession is closing due to unrecoverable error", exc_info=error.error
+        )
 
         async def drain_and_close() -> None:
             await self.drain()
@@ -605,7 +630,16 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             return
 
         async for frame in audio_input:
+            # Record timestamp when frame is received from audio_input
+            record_audio_frame_timestamp(
+                frame, "AgentSession", "frame_received_from_audio_input"
+            )
+
             if self._activity is not None:
+                # Record timestamp before pushing to activity
+                record_audio_frame_timestamp(
+                    frame, "AgentSession", "frame_pushed_to_activity"
+                )
                 self._activity.push_audio(frame)
 
     @utils.log_exceptions(logger=logger)
@@ -616,7 +650,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         async for frame in video_input:
             if self._activity is not None:
-                if self._video_sampler is not None and not self._video_sampler(frame, self):
+                if self._video_sampler is not None and not self._video_sampler(
+                    frame, self
+                ):
                     continue  # ignore this frame
 
                 self._activity.push_video(frame)
@@ -628,7 +664,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         old_state = self._agent_state
         self._agent_state = state
         self.emit(
-            "agent_state_changed", AgentStateChangedEvent(old_state=old_state, new_state=state)
+            "agent_state_changed",
+            AgentStateChangedEvent(old_state=old_state, new_state=state),
         )
 
     def _update_user_state(self, state: UserState) -> None:
@@ -637,7 +674,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         old_state = self._user_state
         self._user_state = state
-        self.emit("user_state_changed", UserStateChangedEvent(old_state=old_state, new_state=state))
+        self.emit(
+            "user_state_changed",
+            UserStateChangedEvent(old_state=old_state, new_state=state),
+        )
 
     def _conversation_item_added(self, message: llm.ChatMessage) -> None:
         self._chat_ctx.items.append(message)

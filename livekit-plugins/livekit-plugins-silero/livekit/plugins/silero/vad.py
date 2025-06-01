@@ -31,6 +31,11 @@ from livekit.agents.types import (
     NotGivenOr,
 )
 from livekit.agents.utils import is_given
+from livekit.agents.utils.common_audio_logger import (
+    record_audio_frame_timestamp,
+    calculate_dbfs_for_frame,
+    get_and_format_frame_journey,
+)
 
 from . import onnx_model
 from .log import logger
@@ -202,7 +207,9 @@ class VAD(agents.vad.VAD):
 
 
 class VADStream(agents.vad.VADStream):
-    def __init__(self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel) -> None:
+    def __init__(
+        self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel
+    ) -> None:
         super().__init__(vad)
         self._opts, self._model = opts, model
         self._loop = asyncio.get_event_loop()
@@ -293,6 +300,47 @@ class VADStream(agents.vad.VADStream):
             if not isinstance(input_frame, rtc.AudioFrame):
                 continue  # ignore flush sentinel for now
 
+            # Record timestamp for frame arrival at VAD and calculate dBFS as per execution plan
+            current_ts_ns = time.time_ns()
+            record_audio_frame_timestamp(
+                frame=input_frame,
+                component_name="SileroVADStream",
+                event_description="frame_received_from_input_ch",
+                timestamp_ns=current_ts_ns,
+            )
+
+            # Calculate dBFS for this specific input_frame
+            dbfs_current_frame = calculate_dbfs_for_frame(input_frame.data)
+
+            # Update metadata for this input_frame with its dBFS
+            record_audio_frame_timestamp(
+                frame=input_frame,
+                component_name="SileroVADStream",
+                event_description="dbfs_calculated_for_input_frame",
+                timestamp_ns=current_ts_ns,
+                additional_metadata={
+                    "dbfs_input_frame": (
+                        round(dbfs_current_frame, 2)
+                        if dbfs_current_frame > -float("inf")
+                        else -float("inf")
+                    )
+                },
+            )
+
+            # Conditional Final Logging for this input_frame's journey
+            if dbfs_current_frame > -float("inf"):
+                log_entry = get_and_format_frame_journey(
+                    frame=input_frame,
+                    current_component="SileroVADStream",
+                    current_event="frame_processed_at_vad_entry",
+                    current_ts_ns=current_ts_ns,
+                    additional_info={
+                        "log_trigger_reason": "input_frame_significant_dbfs_at_vad_entry"
+                    },
+                )
+                if log_entry:
+                    logger.info(log_entry)
+
             if not self._input_sample_rate:
                 self._input_sample_rate = input_frame.sample_rate
 
@@ -356,14 +404,17 @@ class VADStream(agents.vad.VADStream):
                 )
                 p = self._exp_filter.apply(exp=1.0, sample=p)
 
-                window_duration = self._model.window_size_samples / self._opts.sample_rate
+                window_duration = (
+                    self._model.window_size_samples / self._opts.sample_rate
+                )
 
                 pub_current_sample += self._model.window_size_samples
                 pub_timestamp += window_duration
 
                 resampling_ratio = self._input_sample_rate / self._model.sample_rate
                 to_copy = (
-                    self._model.window_size_samples * resampling_ratio + input_copy_remaining_fract
+                    self._model.window_size_samples * resampling_ratio
+                    + input_copy_remaining_fract
                 )
                 to_copy_int = int(to_copy)
                 input_copy_remaining_fract = to_copy - to_copy_int
@@ -402,7 +453,8 @@ class VADStream(agents.vad.VADStream):
                         return
 
                     padding_data = self._speech_buffer[
-                        speech_buffer_index - self._prefix_padding_samples : speech_buffer_index
+                        speech_buffer_index
+                        - self._prefix_padding_samples : speech_buffer_index
                     ]
 
                     self._speech_buffer_max_reached = False
@@ -412,7 +464,9 @@ class VADStream(agents.vad.VADStream):
                 def _copy_speech_buffer() -> rtc.AudioFrame:
                     # copy the data from speech_buffer
                     assert self._speech_buffer is not None
-                    speech_data = self._speech_buffer[:speech_buffer_index].tobytes()  # noqa: B023
+                    speech_data = self._speech_buffer[
+                        :speech_buffer_index
+                    ].tobytes()  # noqa: B023
 
                     return rtc.AudioFrame(
                         sample_rate=self._input_sample_rate,
@@ -480,7 +534,8 @@ class VADStream(agents.vad.VADStream):
 
                     if (
                         pub_speaking
-                        and silence_threshold_duration >= self._opts.min_silence_duration
+                        and silence_threshold_duration
+                        >= self._opts.min_silence_duration
                     ):
                         pub_speaking = False
                         pub_speech_duration = 0.0
@@ -517,7 +572,9 @@ class VADStream(agents.vad.VADStream):
                     )
 
                 if len(inference_frame.data) - self._model.window_size_samples > 0:
-                    data = inference_frame.data[self._model.window_size_samples :].tobytes()
+                    data = inference_frame.data[
+                        self._model.window_size_samples :
+                    ].tobytes()
                     inference_frames.append(
                         rtc.AudioFrame(
                             data=data,
