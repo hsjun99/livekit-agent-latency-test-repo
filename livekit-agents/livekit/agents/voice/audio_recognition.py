@@ -15,6 +15,23 @@ from ..utils import aio
 from . import io
 from .agent import ModelSettings
 
+# Safe audio logging imports
+try:
+    from ..utils.safe_audio_logging import safe_log_checkpoint, safe_timing
+
+    SAFE_LOGGING_AVAILABLE = True
+except ImportError:
+    SAFE_LOGGING_AVAILABLE = False
+
+    # Create no-op functions if logging module not available
+    def safe_log_checkpoint(*args, **kwargs):
+        return None
+
+    def safe_timing(*args, **kwargs):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
 
 @dataclass
 class _EndOfTurnInfo:
@@ -98,11 +115,36 @@ class AudioRecognition:
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         self._sample_rate = frame.sample_rate
+
+        # SAFE: Log critical distribution point
+        frame_id = safe_log_checkpoint(
+            "audio_recognition_input",
+            frame,
+            extra={
+                "distribution_target": "stt_and_vad",
+                "stt_enabled": self._stt_ch is not None,
+                "vad_enabled": self._vad_ch is not None,
+            },
+            filter_silent=True,
+        )
+
         if self._stt_ch is not None:
-            self._stt_ch.send_nowait(frame)
+            # SAFE: Time STT channel send
+            with safe_timing(
+                frame_id,
+                "stt_channel_send_nowait",
+                extra={"queue_size": getattr(self._stt_ch, "qsize", lambda: None)()},
+            ):
+                self._stt_ch.send_nowait(frame)
 
         if self._vad_ch is not None:
-            self._vad_ch.send_nowait(frame)
+            # SAFE: Time VAD channel send
+            with safe_timing(
+                frame_id,
+                "vad_channel_send_nowait",
+                extra={"queue_size": getattr(self._vad_ch, "qsize", lambda: None)()},
+            ):
+                self._vad_ch.send_nowait(frame)
 
     async def aclose(self) -> None:
         await aio.cancel_and_wait(*self._tasks)
@@ -294,14 +336,21 @@ class AudioRecognition:
 
             if turn_detector is not None:
                 if not turn_detector.supports_language(self._last_language):
-                    logger.debug("Turn detector does not support language %s", self._last_language)
+                    logger.debug(
+                        "Turn detector does not support language %s",
+                        self._last_language,
+                    )
                 else:
-                    end_of_turn_probability = await turn_detector.predict_end_of_turn(chat_ctx)
+                    end_of_turn_probability = await turn_detector.predict_end_of_turn(
+                        chat_ctx
+                    )
                     tracing.Tracing.log_event(
                         "end of user turn probability",
                         {"probability": end_of_turn_probability},
                     )
-                    unlikely_threshold = turn_detector.unlikely_threshold(self._last_language)
+                    unlikely_threshold = turn_detector.unlikely_threshold(
+                        self._last_language
+                    )
                     if (
                         unlikely_threshold is not None
                         and end_of_turn_probability < unlikely_threshold
@@ -311,7 +360,9 @@ class AudioRecognition:
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))
 
-            tracing.Tracing.log_event("end of user turn", {"transcript": self._audio_transcript})
+            tracing.Tracing.log_event(
+                "end of user turn", {"transcript": self._audio_transcript}
+            )
             committed = await self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
                     new_transcript=self._audio_transcript,
@@ -330,7 +381,9 @@ class AudioRecognition:
             self._end_of_turn_task.cancel()
 
         # copy the last_speaking_time before awaiting (the value can change)
-        self._end_of_turn_task = asyncio.create_task(_bounce_eou_task(self._last_speaking_time))
+        self._end_of_turn_task = asyncio.create_task(
+            _bounce_eou_task(self._last_speaking_time)
+        )
 
     @utils.log_exceptions(logger=logger)
     async def _stt_task(
@@ -351,7 +404,9 @@ class AudioRecognition:
 
         if isinstance(node, AsyncIterable):
             async for ev in node:
-                assert isinstance(ev, stt.SpeechEvent), "STT node must yield SpeechEvent"
+                assert isinstance(
+                    ev, stt.SpeechEvent
+                ), "STT node must yield SpeechEvent"
                 await self._on_stt_event(ev)
 
     @utils.log_exceptions(logger=logger)

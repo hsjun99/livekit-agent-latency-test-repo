@@ -35,6 +35,24 @@ from livekit.agents.utils import is_given
 from . import onnx_model
 from .log import logger
 
+# Safe audio logging imports
+try:
+    from livekit.agents.utils.safe_audio_logging import safe_log_checkpoint, safe_timing
+
+    SAFE_LOGGING_AVAILABLE = True
+except ImportError:
+    SAFE_LOGGING_AVAILABLE = False
+
+    # Create no-op functions if logging module not available
+    def safe_log_checkpoint(*args, **kwargs):
+        return None
+
+    def safe_timing(*args, **kwargs):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+
 SLOW_INFERENCE_THRESHOLD = 0.2  # late by 200ms
 
 
@@ -202,7 +220,9 @@ class VAD(agents.vad.VAD):
 
 
 class VADStream(agents.vad.VADStream):
-    def __init__(self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel) -> None:
+    def __init__(
+        self, vad: VAD, opts: _VADOptions, model: onnx_model.OnnxModel
+    ) -> None:
         super().__init__(vad)
         self._opts, self._model = opts, model
         self._loop = asyncio.get_event_loop()
@@ -293,6 +313,17 @@ class VADStream(agents.vad.VADStream):
             if not isinstance(input_frame, rtc.AudioFrame):
                 continue  # ignore flush sentinel for now
 
+            # SAFE: Log VAD frame dequeue
+            frame_id = safe_log_checkpoint(
+                "vad_frame_dequeue",
+                input_frame,
+                extra={
+                    "queue_depth": getattr(self._input_ch, "qsize", lambda: None)(),
+                    "vad_type": "silero",
+                },
+                filter_silent=True,
+            )
+
             if not self._input_sample_rate:
                 self._input_sample_rate = input_frame.sample_rate
 
@@ -339,31 +370,74 @@ class VADStream(agents.vad.VADStream):
                 if available_inference_samples < self._model.window_size_samples:
                     break  # not enough samples to run inference
 
-                input_frame = utils.combine_frames(input_frames)
-                inference_frame = utils.combine_frames(inference_frames)
+                # SAFE: Time frame combination for VAD window
+                with safe_timing(
+                    frame_id,
+                    "vad_frame_combination",
+                    extra={
+                        "frames_combined": len(inference_frames),
+                        "window_size_samples": self._model.window_size_samples,
+                        "total_samples": available_inference_samples,
+                    },
+                ):
+                    input_frame = utils.combine_frames(input_frames)
+                    inference_frame = utils.combine_frames(inference_frames)
 
-                # convert data to f32
-                np.divide(
-                    inference_frame.data[: self._model.window_size_samples],
-                    np.iinfo(np.int16).max,
-                    out=inference_f32_data,
-                    dtype=np.float32,
+                # SAFE: Time data format conversion
+                with safe_timing(
+                    frame_id,
+                    "vad_data_conversion",
+                    extra={
+                        "samples_converted": self._model.window_size_samples,
+                        "input_dtype": "int16",
+                        "output_dtype": "float32",
+                    },
+                ):
+                    # convert data to f32
+                    np.divide(
+                        inference_frame.data[: self._model.window_size_samples],
+                        np.iinfo(np.int16).max,
+                        out=inference_f32_data,
+                        dtype=np.float32,
+                    )
+
+                # CRITICAL: VAD Inference
+                inference_start_ns = time.time_ns()
+
+                # SAFE: Time VAD inference execution
+                with safe_timing(
+                    frame_id,
+                    "vad_inference_execution_silero",
+                    extra={
+                        "model_type": "silero_onnx",
+                        "window_size": self._model.window_size_samples,
+                    },
+                ):
+                    # run the inference
+                    p = await self._loop.run_in_executor(
+                        self._executor, self._model, inference_f32_data
+                    )
+
+                inference_end_ns = time.time_ns()
+                inference_duration_ms = (
+                    inference_end_ns - inference_start_ns
+                ) / 1_000_000
+
+                # SAFE: Time exponential filtering
+                with safe_timing(frame_id, "vad_exponential_filtering"):
+                    p = self._exp_filter.apply(exp=1.0, sample=p)
+
+                window_duration = (
+                    self._model.window_size_samples / self._opts.sample_rate
                 )
-
-                # run the inference
-                p = await self._loop.run_in_executor(
-                    self._executor, self._model, inference_f32_data
-                )
-                p = self._exp_filter.apply(exp=1.0, sample=p)
-
-                window_duration = self._model.window_size_samples / self._opts.sample_rate
 
                 pub_current_sample += self._model.window_size_samples
                 pub_timestamp += window_duration
 
                 resampling_ratio = self._input_sample_rate / self._model.sample_rate
                 to_copy = (
-                    self._model.window_size_samples * resampling_ratio + input_copy_remaining_fract
+                    self._model.window_size_samples * resampling_ratio
+                    + input_copy_remaining_fract
                 )
                 to_copy_int = int(to_copy)
                 input_copy_remaining_fract = to_copy - to_copy_int
@@ -388,6 +462,24 @@ class VADStream(agents.vad.VADStream):
                     0.0,
                     extra_inference_time + inference_duration - window_duration,
                 )
+
+                # SAFE: Log VAD inference completion with detailed results
+                safe_log_checkpoint(
+                    "vad_inference_complete",
+                    inference_frame,
+                    frame_id=frame_id,
+                    extra={
+                        "raw_probability": round(p, 6),
+                        "filtered_probability": round(p, 6),
+                        "inference_latency_ms": round(inference_duration_ms, 3),
+                        "exceeds_threshold": p >= self._opts.activation_threshold,
+                        "activation_threshold": self._opts.activation_threshold,
+                        "model_type": "silero_onnx",
+                    },
+                    filter_silent=True,
+                )
+
+                # Track slow inference
                 if inference_duration > SLOW_INFERENCE_THRESHOLD:
                     logger.warning(
                         "inference is slower than realtime",
@@ -402,7 +494,8 @@ class VADStream(agents.vad.VADStream):
                         return
 
                     padding_data = self._speech_buffer[
-                        speech_buffer_index - self._prefix_padding_samples : speech_buffer_index
+                        speech_buffer_index
+                        - self._prefix_padding_samples : speech_buffer_index
                     ]
 
                     self._speech_buffer_max_reached = False
@@ -412,7 +505,9 @@ class VADStream(agents.vad.VADStream):
                 def _copy_speech_buffer() -> rtc.AudioFrame:
                     # copy the data from speech_buffer
                     assert self._speech_buffer is not None
-                    speech_data = self._speech_buffer[:speech_buffer_index].tobytes()  # noqa: B023
+                    speech_data = self._speech_buffer[
+                        :speech_buffer_index
+                    ].tobytes()  # noqa: B023
 
                     return rtc.AudioFrame(
                         sample_rate=self._input_sample_rate,
@@ -480,7 +575,8 @@ class VADStream(agents.vad.VADStream):
 
                     if (
                         pub_speaking
-                        and silence_threshold_duration >= self._opts.min_silence_duration
+                        and silence_threshold_duration
+                        >= self._opts.min_silence_duration
                     ):
                         pub_speaking = False
                         pub_speech_duration = 0.0
@@ -517,7 +613,9 @@ class VADStream(agents.vad.VADStream):
                     )
 
                 if len(inference_frame.data) - self._model.window_size_samples > 0:
-                    data = inference_frame.data[self._model.window_size_samples :].tobytes()
+                    data = inference_frame.data[
+                        self._model.window_size_samples :
+                    ].tobytes()
                     inference_frames.append(
                         rtc.AudioFrame(
                             data=data,

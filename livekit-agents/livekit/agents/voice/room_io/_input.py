@@ -15,6 +15,24 @@ from ...utils import aio, log_exceptions
 from ..io import AudioInput, VideoInput
 from ._pre_connect_audio import PreConnectAudioHandler
 
+# Safe audio logging imports
+try:
+    from ...utils.safe_audio_logging import safe_log_checkpoint, safe_timing
+
+    SAFE_LOGGING_AVAILABLE = True
+except ImportError:
+    SAFE_LOGGING_AVAILABLE = False
+
+    # Create no-op functions if logging module not available
+    def safe_log_checkpoint(*args, **kwargs):
+        return None
+
+    def safe_timing(*args, **kwargs):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+
 T = TypeVar("T", bound=Union[rtc.AudioFrame, rtc.VideoFrame])
 
 
@@ -90,7 +108,9 @@ class _ParticipantInputStream(Generic[T], ABC):
     def set_participant(self, participant: rtc.Participant | str | None) -> None:
         # set_participant can be called before the participant is connected
         participant_identity = (
-            participant.identity if isinstance(participant, rtc.Participant) else participant
+            participant.identity
+            if isinstance(participant, rtc.Participant)
+            else participant
         )
         if self._participant_identity == participant_identity:
             return
@@ -143,12 +163,33 @@ class _ParticipantInputStream(Generic[T], ABC):
             if not self._attached:
                 # drop frames if the stream is detached
                 continue
-            await self._data_ch.send(event.frame)
+
+            # SAFE: Log WebRTC input - cannot crash
+            frame_id = safe_log_checkpoint(
+                "webrtc_input",
+                event.frame,
+                extra={
+                    "participant": participant.identity,
+                    "source": rtc.TrackSource.Name(publication.source),
+                    "stream_attached": self._attached,
+                },
+                filter_silent=True,
+            )
+
+            # SAFE: Time the channel send operation
+            with safe_timing(
+                frame_id,
+                "webrtc_to_room_io_channel_send",
+                extra={"queue_size": getattr(self._data_ch, "qsize", lambda: None)()},
+            ):
+                await self._data_ch.send(event.frame)
 
         logger.debug("stream closed", extra=extra)
 
     @abstractmethod
-    def _create_stream(self, track: rtc.RemoteTrack) -> rtc.VideoStream | rtc.AudioStream: ...
+    def _create_stream(
+        self, track: rtc.RemoteTrack
+    ) -> rtc.VideoStream | rtc.AudioStream: ...
 
     def _close_stream(self) -> None:
         if self._stream is not None:
@@ -175,12 +216,16 @@ class _ParticipantInputStream(Generic[T], ABC):
         self._stream = self._create_stream(track)
         self._publication = publication
         self._forward_atask = asyncio.create_task(
-            self._forward_task(self._forward_atask, self._stream, publication, participant)
+            self._forward_task(
+                self._forward_atask, self._stream, publication, participant
+            )
         )
         return True
 
     def _on_track_unavailable(
-        self, publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
+        self,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
     ) -> None:
         if (
             not self._publication
@@ -246,9 +291,21 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
             }
             try:
                 duration = 0
-                frames = await self._pre_connect_audio_handler.wait_for_data(publication.track.sid)
+                frames = await self._pre_connect_audio_handler.wait_for_data(
+                    publication.track.sid
+                )
                 for frame in self._resample_frames(frames):
                     if self._attached:
+                        # SAFE: Log pre-connect frame processing
+                        frame_id = safe_log_checkpoint(
+                            "preconnect_audio",
+                            frame,
+                            extra={
+                                "track_id": publication.track.sid,
+                                "buffer_duration_ms": round(duration * 1000, 2),
+                            },
+                            filter_silent=True,
+                        )
                         await self._data_ch.send(frame)
                         duration += frame.duration
                 if frames:
@@ -265,7 +322,9 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
 
             except Exception as e:
                 logger.error(
-                    "error reading pre-connect audio buffer", extra=logging_extra, exc_info=e
+                    "error reading pre-connect audio buffer",
+                    extra=logging_extra,
+                    exc_info=e,
                 )
 
         await super()._forward_task(old_task, stream, publication, participant)
@@ -281,20 +340,60 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
             )
         )
 
-    def _resample_frames(self, frames: Iterable[rtc.AudioFrame]) -> Iterable[rtc.AudioFrame]:
+    def _resample_frames(
+        self, frames: Iterable[rtc.AudioFrame]
+    ) -> Iterable[rtc.AudioFrame]:
         resampler: rtc.AudioResampler | None = None
         for frame in frames:
+            # SAFE: Log input frame to resampling
+            frame_id = safe_log_checkpoint(
+                "resampling_input",
+                frame,
+                extra={
+                    "input_rate": frame.sample_rate,
+                    "target_rate": self._sample_rate,
+                    "resampling_needed": frame.sample_rate != self._sample_rate,
+                },
+                filter_silent=True,
+            )
+
             if (
                 not resampler
                 and self._sample_rate is not None
                 and frame.sample_rate != self._sample_rate
             ):
-                resampler = rtc.AudioResampler(
-                    input_rate=frame.sample_rate, output_rate=self._sample_rate
-                )
+                # SAFE: Time resampler creation
+                with safe_timing(
+                    frame_id,
+                    "resampler_creation",
+                    extra={
+                        "input_rate": frame.sample_rate,
+                        "output_rate": self._sample_rate,
+                    },
+                ):
+                    resampler = rtc.AudioResampler(
+                        input_rate=frame.sample_rate, output_rate=self._sample_rate
+                    )
 
             if resampler:
-                yield from resampler.push(frame)
+                # SAFE: Time resampling operation
+                with safe_timing(
+                    frame_id,
+                    "resampling_operation_push",
+                    extra={"input_samples": frame.samples_per_channel},
+                ):
+                    resampled_frames_list = list(resampler.push(frame))
+
+                # SAFE: Log each resampled output frame
+                for i, resampled_frame in enumerate(resampled_frames_list):
+                    output_frame_id = safe_log_checkpoint(
+                        "resampling_output",
+                        resampled_frame,
+                        frame_id=f"{frame_id}_out_{i}",
+                        extra={"original_frame_id": frame_id, "resampled_index": i},
+                        filter_silent=True,
+                    )
+                    yield resampled_frame
             else:
                 yield frame
 

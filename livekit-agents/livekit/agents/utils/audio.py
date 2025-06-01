@@ -12,6 +12,24 @@ from livekit import rtc
 from ..log import logger
 from .aio.utils import cancel_and_wait
 
+# Safe audio logging imports
+try:
+    from .safe_audio_logging import safe_log_checkpoint, safe_timing
+
+    SAFE_LOGGING_AVAILABLE = True
+except ImportError:
+    SAFE_LOGGING_AVAILABLE = False
+
+    # Create no-op functions if logging module not available
+    def safe_log_checkpoint(*args, **kwargs):
+        return None
+
+    def safe_timing(*args, **kwargs):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+
 # deprecated aliases
 AudioBuffer = Union[list[rtc.AudioFrame], rtc.AudioFrame]
 
@@ -99,21 +117,73 @@ class AudioByteStream:
         (e.g., from a stream or file) and receive back a list of
         fixed-size audio frames ready for processing or transmission.
         """
-        self._buf.extend(data)
+        # Create temporary frame for logging input
+        temp_frame = rtc.AudioFrame(
+            data=data,
+            sample_rate=self._sample_rate,
+            num_channels=self._num_channels,
+            samples_per_channel=len(data) // self._bytes_per_sample,
+        )
+
+        # SAFE: Log AudioByteStream input
+        frame_id = safe_log_checkpoint(
+            "audiobytestream_input",
+            temp_frame,
+            extra={
+                "target_chunk_size_ms": round(
+                    (self._bytes_per_frame / self._bytes_per_sample)
+                    / self._sample_rate
+                    * 1000,
+                    2,
+                ),
+                "buffer_fill_bytes": len(self._buf),
+                "frame_size_bytes": len(data),
+            },
+            filter_silent=True,
+        )
+
+        # SAFE: Time buffer append operation
+        with safe_timing(
+            frame_id, "audiobytestream_buffer_append", extra={"size_bytes": len(data)}
+        ):
+            self._buf.extend(data)
 
         frames = []
+        chunk_count = 0
         while len(self._buf) >= self._bytes_per_frame:
-            frame_data = self._buf[: self._bytes_per_frame]
-            self._buf = self._buf[self._bytes_per_frame :]
+            chunk_count += 1
+            chunk_frame_id = f"{frame_id}_chunk_{chunk_count}"
 
-            frames.append(
-                rtc.AudioFrame(
+            # SAFE: Time chunk creation logic
+            with safe_timing(
+                chunk_frame_id,
+                "audiobytestream_chunk_creation_logic",
+                extra={"chunk_size_bytes_target": self._bytes_per_frame},
+            ):
+                frame_data = self._buf[: self._bytes_per_frame]
+                self._buf = self._buf[self._bytes_per_frame :]
+
+                chunk_frame = rtc.AudioFrame(
                     data=frame_data,
                     sample_rate=self._sample_rate,
                     num_channels=self._num_channels,
                     samples_per_channel=len(frame_data) // self._bytes_per_sample,
                 )
+
+            # SAFE: Log chunk output
+            safe_log_checkpoint(
+                "audiobytestream_chunk_output",
+                chunk_frame,
+                frame_id=chunk_frame_id,
+                extra={
+                    "original_frame_id": frame_id,
+                    "chunk_number": chunk_count,
+                    "buffer_remaining_bytes": len(self._buf),
+                },
+                filter_silent=True,
             )
+
+            frames.append(chunk_frame)
 
         return frames
 
