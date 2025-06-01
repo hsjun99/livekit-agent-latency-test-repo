@@ -7,6 +7,9 @@ from livekit.agents.log import logger
 from typing import Optional, Dict, Any
 import weakref
 
+import numpy as np
+import math
+
 
 class SafeAudioLogger:
     """Ultra-safe audio logging that cannot crash or impact original functionality."""
@@ -66,30 +69,49 @@ class SafeAudioLogger:
             }
 
     def simple_audio_content_check(self, frame: rtc.AudioFrame) -> bool:
-        """Simple, safe check if frame contains audio content (no complex calculations)."""
+        """Check if frame contains audio content based on RMS > 0 (dBFS > -inf)."""
         try:
-            # Basic checks that are very fast and safe
-            if not frame.data or len(frame.data) == 0:
+            if not frame or not frame.data or len(frame.data) == 0:
                 return False
 
-            # Convert to bytes if needed (safe operation)
-            if hasattr(frame.data, "tobytes"):
-                data_bytes = frame.data.tobytes()
+            # Convert frame data to numpy array
+            if isinstance(frame.data, memoryview):
+                audio_data = np.frombuffer(frame.data, dtype=np.int16)
             else:
-                data_bytes = bytes(frame.data)
+                # Attempt to convert to bytes if it's not already, then frombuffer
+                # This handles cases where frame.data might be a different buffer type
+                audio_data = np.frombuffer(
+                    (
+                        frame.data.tobytes()
+                        if hasattr(frame.data, "tobytes")
+                        else bytes(frame.data)
+                    ),
+                    dtype=np.int16,
+                )
 
-            # Simple check: if most bytes are zero, likely silence
-            # This is much faster and safer than FFT/RMS calculations
-            zero_count = data_bytes.count(b"\x00")
-            silence_ratio = zero_count / len(data_bytes)
+            if len(audio_data) == 0:
+                return False  # Should have been caught by frame.data check, but as a safeguard
 
-            # If more than 90% of bytes are zero, consider it silence
-            has_content = silence_ratio < 0.90
+            # Convert to float64 for precision in RMS calculation
+            audio_float = audio_data.astype(np.float64)
 
+            # Calculate RMS
+            # np.mean will be NaN for empty array, but we check len(audio_data) == 0 earlier
+            rms = np.sqrt(np.mean(np.square(audio_float)))
+
+            # If RMS > 0, then dBFS > -infinity, meaning there's some audio content
+            has_content = rms > 0
             return has_content
 
-        except Exception:
-            # If anything fails, assume it has content (safe fallback)
+        except Exception as e:
+            # If any calculation fails, log the error and assume it has content (safe fallback)
+            try:
+                logger.warning(
+                    f"Audio content check error (falling back to True): {e}",
+                    exc_info=True,
+                )
+            except:
+                pass  # Even logging the error failed
             return True
 
     def log_checkpoint(
