@@ -17,7 +17,11 @@ from ._pre_connect_audio import PreConnectAudioHandler
 
 # Safe audio logging imports
 try:
-    from ...utils.safe_audio_logging import safe_log_checkpoint, safe_timing
+    from ...utils.safe_audio_logging import (
+        safe_log_checkpoint,
+        safe_timing,
+        log_frame_final_stats,
+    )
 
     SAFE_LOGGING_AVAILABLE = True
 except ImportError:
@@ -31,6 +35,9 @@ except ImportError:
         from contextlib import nullcontext
 
         return nullcontext()
+
+    def log_frame_final_stats(*args, **kwargs):
+        return None
 
 
 T = TypeVar("T", bound=Union[rtc.AudioFrame, rtc.VideoFrame])
@@ -393,8 +400,16 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
                         extra={"original_frame_id": frame_id, "resampled_index": i},
                         filter_silent=True,
                     )
+
+                    # Log final stats for resampled frame as it completes the resampling pipeline
+                    if output_frame_id:
+                        log_frame_final_stats(output_frame_id)
+
                     yield resampled_frame
             else:
+                # Log final stats for non-resampled frame as it passes through
+                if frame_id:
+                    log_frame_final_stats(frame_id)
                 yield frame
 
         if resampler:

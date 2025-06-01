@@ -17,7 +17,11 @@ from .agent import ModelSettings
 
 # Safe audio logging imports
 try:
-    from ..utils.safe_audio_logging import safe_log_checkpoint, safe_timing
+    from ..utils.safe_audio_logging import (
+        safe_log_checkpoint,
+        safe_timing,
+        log_frame_final_stats,
+    )
 
     SAFE_LOGGING_AVAILABLE = True
 except ImportError:
@@ -31,6 +35,9 @@ except ImportError:
         from contextlib import nullcontext
 
         return nullcontext()
+
+    def log_frame_final_stats(*args, **kwargs):
+        return None
 
 
 @dataclass
@@ -278,6 +285,14 @@ class AudioRecognition:
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._audio_interim_transcript = ""
+
+            # Log final stats for frames that contributed to this final transcript
+            # Note: We don't have direct frame_id tracking here, but this marks
+            # the completion of the STT pipeline for recent frames
+            logger.debug(
+                "STT pipeline completed for final transcript",
+                extra={"transcript": transcript, "language": self._last_language},
+            )
 
             if not self._speaking:
                 if not self._vad:

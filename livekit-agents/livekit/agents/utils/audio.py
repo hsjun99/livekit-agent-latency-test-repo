@@ -14,7 +14,11 @@ from .aio.utils import cancel_and_wait
 
 # Safe audio logging imports
 try:
-    from .safe_audio_logging import safe_log_checkpoint, safe_timing
+    from .safe_audio_logging import (
+        safe_log_checkpoint,
+        safe_timing,
+        log_frame_final_stats,
+    )
 
     SAFE_LOGGING_AVAILABLE = True
 except ImportError:
@@ -28,6 +32,9 @@ except ImportError:
         from contextlib import nullcontext
 
         return nullcontext()
+
+    def log_frame_final_stats(*args, **kwargs):
+        return None
 
 
 # deprecated aliases
@@ -193,6 +200,10 @@ class AudioByteStream:
                 },
                 filter_silent=True,
             )
+
+            # Log final stats for this chunk as it completes the AudioByteStream pipeline
+            if chunk_frame_id:
+                log_frame_final_stats(chunk_frame_id)
 
             frames.append(chunk_frame)
 

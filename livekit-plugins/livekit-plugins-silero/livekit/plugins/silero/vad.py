@@ -37,7 +37,11 @@ from .log import logger
 
 # Safe audio logging imports
 try:
-    from livekit.agents.utils.safe_audio_logging import safe_log_checkpoint, safe_timing
+    from livekit.agents.utils.safe_audio_logging import (
+        safe_log_checkpoint,
+        safe_timing,
+        log_frame_final_stats,
+    )
 
     SAFE_LOGGING_AVAILABLE = True
 except ImportError:
@@ -51,6 +55,9 @@ except ImportError:
         from contextlib import nullcontext
 
         return nullcontext()
+
+    def log_frame_final_stats(*args, **kwargs):
+        return None
 
 
 SLOW_INFERENCE_THRESHOLD = 0.2  # late by 200ms
@@ -478,6 +485,10 @@ class VADStream(agents.vad.VADStream):
                     },
                     filter_silent=True,
                 )
+
+                # Log final stats for this frame as it completes VAD inference
+                if frame_id:
+                    log_frame_final_stats(frame_id)
 
                 # Track slow inference
                 if inference_duration > SLOW_INFERENCE_THRESHOLD:
