@@ -169,6 +169,9 @@ class SafeAudioLogger:
         self, frame_id: str, operation: str, duration_ns: int, extra: Dict = None
     ):
         """Internal timing logging implementation."""
+        if frame_id is None:
+            return
+
         log_data = {
             "event": "AUDIO_TIMING",
             "frame_id": frame_id,
