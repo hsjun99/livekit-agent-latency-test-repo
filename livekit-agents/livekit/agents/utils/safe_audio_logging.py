@@ -153,7 +153,8 @@ class SafeAudioLogger:
         # Estimate memory usage (very rough)
         self.current_memory_estimate += len(str(log_data))
 
-        logger.info("SAFE_AUDIO_LOG", extra=log_data)
+        # logger.info("SAFE_AUDIO_LOG", extra=log_data)
+        logger.info(f"SAFE_AUDIO_LOG: {log_data}")
         return frame_id
 
     def log_timing(
@@ -183,7 +184,8 @@ class SafeAudioLogger:
             except:
                 log_data["extra_data_error"] = True
 
-        logger.info("SAFE_AUDIO_LOG", extra=log_data)
+        # logger.info("SAFE_AUDIO_LOG", extra=log_data)
+        logger.info(f"SAFE_AUDIO_LOG: {log_data}")
 
     def cleanup_old_data(self):
         """Clean up old tracking data safely."""
