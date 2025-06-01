@@ -294,6 +294,20 @@ class AudioRecognition:
                 extra={"transcript": transcript, "language": self._last_language},
             )
 
+            # Log STT completion checkpoint
+            # Note: No specific frame_id here since STT processes accumulated audio
+            safe_log_checkpoint(
+                "stt_final_transcript_generated",
+                frame=None,
+                extra={
+                    "transcript": transcript,
+                    "language": self._last_language,
+                    "transcript_length": len(transcript),
+                    "accumulated_transcript": self._audio_transcript,
+                },
+                filter_silent=False,
+            )
+
             if not self._speaking:
                 if not self._vad:
                     # vad disabled, use stt timestamp

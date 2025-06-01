@@ -401,15 +401,8 @@ class _ParticipantAudioInputStream(_ParticipantInputStream[rtc.AudioFrame], Audi
                         filter_silent=True,
                     )
 
-                    # Log final stats for resampled frame as it completes the resampling pipeline
-                    if output_frame_id:
-                        log_frame_final_stats(output_frame_id)
-
                     yield resampled_frame
             else:
-                # Log final stats for non-resampled frame as it passes through
-                if frame_id:
-                    log_frame_final_stats(frame_id)
                 yield frame
 
         if resampler:

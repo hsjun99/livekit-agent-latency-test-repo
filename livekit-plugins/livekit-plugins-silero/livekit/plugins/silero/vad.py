@@ -40,7 +40,7 @@ try:
     from livekit.agents.utils.safe_audio_logging import (
         safe_log_checkpoint,
         safe_timing,
-        log_frame_final_stats,
+        mark_frame_pipeline_complete,
     )
 
     SAFE_LOGGING_AVAILABLE = True
@@ -56,7 +56,7 @@ except ImportError:
 
         return nullcontext()
 
-    def log_frame_final_stats(*args, **kwargs):
+    def mark_frame_pipeline_complete(*args, **kwargs):
         return None
 
 
@@ -486,9 +486,9 @@ class VADStream(agents.vad.VADStream):
                     filter_silent=True,
                 )
 
-                # Log final stats for this frame as it completes VAD inference
+                # Mark frame as having completed VAD processing pipeline
                 if frame_id:
-                    log_frame_final_stats(frame_id)
+                    mark_frame_pipeline_complete(frame_id, "vad_processing_complete")
 
                 # Track slow inference
                 if inference_duration > SLOW_INFERENCE_THRESHOLD:

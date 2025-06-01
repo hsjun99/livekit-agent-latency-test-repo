@@ -199,9 +199,9 @@ class SafeAudioLogger:
             rms = np.sqrt(np.mean(np.square(audio_float)))
 
             # If RMS > 0, then dBFS > -infinity, meaning there's some audio content
-            has_content = bool(rms > 0)
-            if has_content:
-                logger.info(f"DBFS: {20 * np.log10(rms)}")
+            has_content = 20 * np.log10(rms) > 30
+            # if has_content:
+            #     logger.info(f"DBFS: {20 * np.log10(rms)}")
             return has_content
 
         except Exception as e:
@@ -485,6 +485,36 @@ class SafeAudioLogger:
         # logger.info("COMPREHENSIVE_AUDIO_LOG", extra=log_data)
         logger.info(f"COMPREHENSIVE_AUDIO_LOG: {log_data}")
 
+    def mark_frame_pipeline_complete(
+        self, frame_id: str, completion_location: str = "pipeline_complete"
+    ):
+        """Mark a frame as having completed its full pipeline journey and generate final stats."""
+        if not frame_id:
+            return
+
+        try:
+            # Log a final checkpoint to mark completion
+            current_time_ns = time.time_ns()
+
+            log_data = {
+                "event": "AUDIO_CHECKPOINT",
+                "location": completion_location,
+                "frame_id": frame_id,
+                "timestamp_ns": current_time_ns,
+                "pipeline_status": "completed",
+            }
+
+            logger.info("COMPREHENSIVE_AUDIO_LOG", extra=log_data)
+
+            # Track this final checkpoint
+            self.track_frame_checkpoint(frame_id, completion_location, current_time_ns)
+
+            # Generate final stats now that we have a complete journey
+            self.log_frame_final_stats(frame_id)
+
+        except:
+            pass  # Safe fallback
+
     def cleanup_old_data(self):
         """Clean up old tracking data safely."""
         try:
@@ -544,3 +574,10 @@ def configure_safe_logging(enabled: bool = True, max_memory_mb: int = 50):
 def log_frame_final_stats(frame_id: str):
     """Generate final stats for a frame."""
     _safe_logger.log_frame_final_stats(frame_id)
+
+
+def mark_frame_pipeline_complete(
+    frame_id: str, completion_location: str = "pipeline_complete"
+):
+    """Mark a frame as having completed its pipeline and generate final stats."""
+    _safe_logger.mark_frame_pipeline_complete(frame_id, completion_location)

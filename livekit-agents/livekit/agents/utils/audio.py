@@ -201,10 +201,6 @@ class AudioByteStream:
                 filter_silent=True,
             )
 
-            # Log final stats for this chunk as it completes the AudioByteStream pipeline
-            if chunk_frame_id:
-                log_frame_final_stats(chunk_frame_id)
-
             frames.append(chunk_frame)
 
         return frames
