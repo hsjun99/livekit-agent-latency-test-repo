@@ -141,7 +141,7 @@ def get_and_format_frame_journey(
 
     journey_str = " -> ".join(journey_str_parts)
 
-    log_message = f"AudioFrame ID: {frame_id} - Journey: [ {journey_str} ]"
+    log_message = f"\nAudioFrame ID: {frame_id} - Journey: [ {journey_str} ]\n"
 
     if entry["metadata"]:
         log_message += f" - Metadata: {entry['metadata']}"

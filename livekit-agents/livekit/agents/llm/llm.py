@@ -178,8 +178,11 @@ class LLMStream(ABC):
         )
 
     @utils.log_exceptions(logger=logger)
-    async def _metrics_monitor_task(self, event_aiter: AsyncIterable[ChatChunk]) -> None:
+    async def _metrics_monitor_task(
+        self, event_aiter: AsyncIterable[ChatChunk]
+    ) -> None:
         start_time = time.perf_counter()
+        logger.info(f"LLM STREAM START TIME: {time.time_ns()}")
         ttft = -1.0
         request_id = ""
         usage: CompletionUsage | None = None
@@ -188,6 +191,8 @@ class LLMStream(ABC):
             request_id = ev.id
             if ttft == -1.0:
                 ttft = time.perf_counter() - start_time
+                logger.info(f"LLM TTFT: {ttft}")
+                logger.info(f"LLM STREAM END TIME: {time.time_ns()}")
 
             if ev.usage is not None:
                 usage = ev.usage

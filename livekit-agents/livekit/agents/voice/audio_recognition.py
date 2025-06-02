@@ -283,6 +283,12 @@ class AudioRecognition:
             # when VAD fires END_OF_SPEECH, it already waited for the silence_duration
             self._last_speaking_time = time.time() - ev.silence_duration
 
+            logger.info(f"\nVAD DETECTED END OF SPEECH AT: {time.time_ns()}\n")
+            logger.info(
+                f"\nLAST SPEAKING TIME: {int(time.time_ns()-ev.silence_duration*1_000_000_000)}\n"
+            )  # in ns
+            logger.info(f"\nSILENCE DURATION: {ev.silence_duration}\n")
+
             if not self._manual_turn_detection:
                 chat_ctx = self._hooks.retrieve_chat_ctx().copy()
                 self._run_eou_detection(chat_ctx)
@@ -341,6 +347,13 @@ class AudioRecognition:
                     ),
                     end_of_utterance_delay=time.time() - last_speaking_time,
                 )
+            )
+            logger.info(f"\nEOU DETECTED AT: {time.time_ns()}\n")
+            logger.info(
+                f"\ntranscription_delay: {self._last_final_transcript_time - last_speaking_time}\n"
+            )
+            logger.info(
+                f"\nend_of_utterance_delay: {time.time() - last_speaking_time}\n"
             )
             if committed:
                 # clear the transcript if the user turn was committed

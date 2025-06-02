@@ -95,7 +95,9 @@ class TTS(
         conn_options: APIConnectOptions | None = None,
     ) -> ChunkedStream: ...
 
-    def stream(self, *, conn_options: APIConnectOptions | None = None) -> SynthesizeStream:
+    def stream(
+        self, *, conn_options: APIConnectOptions | None = None
+    ) -> SynthesizeStream:
         raise NotImplementedError(
             "streaming is not supported by this TTS, please use a different TTS or use a StreamAdapter"  # noqa: E501
         )
@@ -138,7 +140,9 @@ class ChunkedStream(ABC):
         self._metrics_task = asyncio.create_task(
             self._metrics_monitor_task(monitor_aiter), name="TTS._metrics_task"
         )
-        self._synthesize_task = asyncio.create_task(self._main_task(), name="TTS._synthesize_task")
+        self._synthesize_task = asyncio.create_task(
+            self._main_task(), name="TTS._synthesize_task"
+        )
         self._synthesize_task.add_done_callback(lambda _: self._event_ch.close())
 
     @property
@@ -153,7 +157,9 @@ class ChunkedStream(ABC):
     def exception(self) -> BaseException | None:
         return self._synthesize_task.exception()
 
-    async def _metrics_monitor_task(self, event_aiter: AsyncIterable[SynthesizedAudio]) -> None:
+    async def _metrics_monitor_task(
+        self, event_aiter: AsyncIterable[SynthesizedAudio]
+    ) -> None:
         """Task used to collect metrics"""
 
         start_time = time.perf_counter()
@@ -253,7 +259,9 @@ class ChunkedStream(ABC):
         try:
             val = await self._event_aiter.__anext__()
         except StopAsyncIteration:
-            if not self._synthesize_task.cancelled() and (exc := self._synthesize_task.exception()):
+            if not self._synthesize_task.cancelled() and (
+                exc := self._synthesize_task.exception()
+            ):
                 raise exc  # noqa: B904
 
             raise StopAsyncIteration from None
@@ -278,7 +286,9 @@ class ChunkedStream(ABC):
 class SynthesizeStream(ABC):
     class _FlushSentinel: ...
 
-    def __init__(self, *, tts: TTS, conn_options: APIConnectOptions | None = None) -> None:
+    def __init__(
+        self, *, tts: TTS, conn_options: APIConnectOptions | None = None
+    ) -> None:
         super().__init__()
         self._tts = tts
         self._conn_options = conn_options or DEFAULT_API_CONNECT_OPTIONS
@@ -349,8 +359,11 @@ class SynthesizeStream(ABC):
         # only set the started time once, it'll get reset after we emit metrics
         if self._started_time == 0:
             self._started_time = time.perf_counter()
+            logger.info(f"TTS STREAM START TIME: {time.time_ns()}")
 
-    async def _metrics_monitor_task(self, event_aiter: AsyncIterable[SynthesizedAudio]) -> None:
+    async def _metrics_monitor_task(
+        self, event_aiter: AsyncIterable[SynthesizedAudio]
+    ) -> None:
         """Task used to collect metrics"""
         audio_duration = 0.0
         ttfb = -1.0
@@ -392,6 +405,8 @@ class SynthesizeStream(ABC):
         async for ev in event_aiter:
             if ttfb == -1.0:
                 ttfb = time.perf_counter() - self._started_time
+                logger.info(f"TTS TTFB: {ttfb}")
+                logger.info(f"TTS STREAM END TIME: {time.time_ns()}")
 
             audio_duration += ev.frame.duration
             request_id = ev.request_id
